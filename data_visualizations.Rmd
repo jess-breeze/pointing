@@ -1,0 +1,1540 @@
+---
+title: "Pointing Project Visualizations"
+output: html_document
+date: "2025-10-29"
+---
+
+# ============================================================================
+# SECTION 1: SETUP AND DATA LOADING
+# ============================================================================
+
+```{r setup, include=FALSE}
+# Load all required packages for the entire analysis
+library(dplyr)        # Data manipulation
+library(ggplot2)      # Visualization
+library(stringr)      # String operations
+library(tidyr)        # Data reshaping
+library(lme4)         # Mixed-effects models
+library(emmeans)      # Post-hoc comparisons
+library(car)          # Assumption testing (Levene's test)
+library(broom.mixed)  # Model summaries
+library(VIM)          # Missing data visualization
+library(corrplot)     # Correlation plots
+library(moments)      # Skewness and kurtosis
+library(knitr)        # Nicely formatting tables
+library(kableExtra)   # Formatting tables even more nicely
+
+# Set global options for consistent plotting and analysis
+theme_set(theme_minimal())
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+set.seed(123)  # For reproducibility
+options(contrasts = c("contr.treatment", "contr.poly"))
+```
+
+```{r load-data}
+# Load the three main datasets:
+# 1. Hearing children (LDP)
+# 2. Homesign children
+# 3. Deaf children (Deaf of Deaf)
+
+hearing_all <- read.csv("~/Library/CloudStorage/Box-Box/Pointing project 2025/datasets/hearing_datasets/all_hearing_August_2025_final.csv")
+homesign_points <- read.csv("~/Library/CloudStorage/Box-Box/Pointing project 2025/datasets/homesign_points2.csv",
+                           stringsAsFactors = FALSE)
+deaf_points <- read.csv("~/Library/CloudStorage/Box-Box/Pointing project 2025/datasets/deaf_datasets/PointCodingExportFINAL_022426.csv",
+                          stringsAsFactors = FALSE)
+```
+
+# ============================================================================
+# SECTION 2: DATA CLEANING AND STANDARDIZATION
+# ============================================================================
+
+```{r helper-functions}
+# Define all helper functions that will be used throughout the analysis
+
+# Function to convert age from months to years;months format
+convert_age <- function(age_months) {
+  case_when(
+    age_months == 18 ~ "1;06",
+    age_months == 22 ~ "1;10",
+    age_months == 26 ~ "2;02",
+    age_months == 30 ~ "2;06",
+    age_months == 34 ~ "2;10",
+    TRUE ~ as.character(age_months)
+  )
+}
+
+# Function to standardize age bins across datasets for comparison
+standardize_age_bins <- function(age) {
+  case_when(
+    age == "2;05" ~ "2;02",
+    age == "3;00" ~ "2;10",
+    age == "3;03" ~ "3;02",
+    age == "3;05" ~ "3;02",
+    age == "3;09" ~ "3;06",
+    age == "3;11" ~ "3;10",
+    age == "4;00" ~ "3;10",
+    age == "4;03" ~ "4;02",
+    TRUE ~ age  # Keep original value if no match
+  )
+}
+
+# Function to create proper age ordering for developmental plots
+create_age_ordering <- function(data) {
+  data %>%
+    mutate(
+      age = gsub("/.*", "", age),
+      age_numeric = as.numeric(sapply(strsplit(age, ";"), function(x) {
+        as.numeric(x[1]) * 12 + as.numeric(x[2])
+      }))
+    ) %>%
+    mutate(age = factor(age, levels = unique(age[order(age_numeric)])))
+}
+
+# Function to create age bins for developmental analysis
+create_age_bins <- function(age_vector) {
+  case_when(
+    age_vector %in% c("1;06", "1;10") ~ "1;06-1;10",
+    age_vector %in% c("2;02", "2;06", "2;10") ~ "2;02-2;10",
+    age_vector %in% c("3;02", "3;10") ~ "3;02-3;10",
+    TRUE ~ as.character(age_vector)
+  )
+}
+
+# Function to calculate summary statistics for duration
+calculate_summary_stats <- function(data, group_vars) {
+  data %>%
+    group_by(!!!syms(group_vars)) %>%
+    summarise(
+      mean_duration = mean(duration_sec, na.rm = TRUE),
+      sd_duration = sd(duration_sec, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+# Function to create consistent density plots for duration analysis
+create_density_plot <- function(data, group_vars, title, fill_color, line_color, y_limits = c(0, 1.0)) {
+  summary_stats <- calculate_summary_stats(data, group_vars)
+
+  ggplot(data, aes(x = duration_sec)) +
+    geom_density(fill = fill_color, alpha = 0.5, color = NA) +
+    geom_vline(
+      data = summary_stats,
+      aes(xintercept = mean_duration),
+      linetype = "dashed",
+      size = 0.8,
+      color = line_color
+    ) +
+    geom_text(
+      data = summary_stats,
+      aes(x = 7.5, y = 0.8,
+          label = paste0("M=", round(mean_duration, 2), "\nSD=", round(sd_duration, 2))),
+      hjust = 1,
+      size = 3,
+      inherit.aes = FALSE
+    ) +
+    facet_grid(reformulate(group_vars[2], group_vars[1])) +
+    labs(title = title, x = "Duration (seconds)", y = "Density") +
+    theme(
+      strip.text = element_text(size = 10, face = "bold"),
+      panel.spacing = unit(0.5, "lines")
+    ) +
+    xlim(0, 8) +
+    ylim(y_limits)
+}
+
+# Function to create subject-level semantic plots
+create_subject_semantic_plot <- function(data, lang_name, title_suffix) {
+  semantic_counts <- data %>%
+    filter(language == lang_name) %>%
+    group_by(subject, age, semantic_cat) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    create_age_ordering()
+
+  ggplot(
+    subset(semantic_counts, !is.na(semantic_cat) & semantic_cat != "unclear" & semantic_cat != "other"),
+    aes(x = age, y = count, fill = semantic_cat)
+  ) +
+    geom_bar(stat = "identity") +
+    labs(
+      title = paste0("Count of Points in ", title_suffix, ", Split by Subject"),
+      x = "Age",
+      y = "Count"
+    ) +
+    scale_fill_discrete(name = "Semantic Category") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text.y = element_text(size = 12)
+    ) +
+    facet_grid(rows = vars(subject), scales = "free_x")
+}
+```
+
+```{r clean-hearing}
+# Clean and standardize HEARING CHILDREN data
+hearing_all <- hearing_all %>%
+  mutate(
+    # Convert age to years;months format
+    age = as.factor(age),
+    age = convert_age(as.numeric(as.character(age))),
+
+    # Simplify utterance types into two main categories
+    simple_utt_type = case_when(
+      modality == "Pronouns" ~ NA_character_,
+      utt_type == "point_alone" ~ "point alone",
+      utt_type %in% c("point+singleword", "point+singleword_pron",
+                      "point_in_multiword_utt", "point+pronoun_in_multiword_utt",
+                      "point+pronoun_only") ~ "point alongside speech",
+      TRUE ~ NA_character_
+    ),
+
+    # Simplify redundancy categories 
+    simple_redundancy = case_when(
+      modality == "Pronouns" ~ NA_character_,
+      pt_redundancy == "Point Alone" ~ "Point Alone",
+      pt_redundancy == "Not Redundant" ~ "Not Redundant",
+      pt_redundancy %in% c("Redundant with Pronoun", "Redundant with Other PoS") ~ "Redundant",
+      TRUE ~ NA_character_
+    ),
+
+    # Count words in utterances and bin large utterances (5+ words grouped)
+    number_of_words = str_count(c_utts, "\\S+"),
+    number_of_words = if_else(number_of_words >= 5, "5+", as.character(number_of_words))
+  ) %>%
+  relocate(number_of_words, .after = c_utts)  # Organize columns logically
+
+# excluding necessary rows
+hearing_all <- hearing_all %>%
+  filter(!grepl("exclude", comments, ignore.case = TRUE))
+```
+
+```{r clean-deaf}
+# Clean and standardize DEAF CHILDREN (ASL) data
+deaf_points <- deaf_points %>%
+  mutate(
+    # Convert duration from milliseconds to seconds for consistency
+    duration_sec = as.numeric(duration_sec),
+
+    # Standardize age categories (combine similar ages)
+    age = if_else(age %in% c("1;07", "1;06"), "1;06", age),
+
+    # Standardize semantic categories
+    semantic_category = if_else(semantic_category == "entity.location", "entity", semantic_category),
+
+    # Handle missing sign counts and bin large utterances
+    number_of_signs = if_else(is.na(number_of_signs), 1, number_of_signs),
+    number_of_signs = if_else(number_of_signs >= 5, "5+", as.character(number_of_signs))
+  ) %>%
+  filter(!is.na(duration_sec))  # Remove incomplete duration data
+```
+
+```{r clean-homesign}
+# Clean and standardize HOMESIGN CHILDREN data
+homesign_points <- homesign_points %>%
+  mutate(
+    # Clean utterance type labels
+    Utterance_type = if_else(Utterance_type == "Alone ", "Alone", Utterance_type),
+
+    # Bin large utterances consistently with other datasets
+    Number.of.signs = if_else(Number.of.signs >= 5, "5+", as.character(Number.of.signs)),
+
+    # Standardize age bins for cross-dataset comparison
+    age = standardize_age_bins(Age),
+    age_precise = Age  # Keep original age for reference
+  ) %>%
+  filter(Subject != "")  # Remove empty entries
+```
+
+```{r prepare-and-combine-datasets}
+# Prepare all datasets for combination with standardized column names
+
+# Prepare deaf (ASL) data
+deaf_points_clean <- deaf_points %>%
+  mutate(
+    modality = "Points",
+    language = "ASL",
+    subject = as.character(subject)
+  ) %>%
+  rename(
+    semantic_cat = semantic_category,
+    utt_type = utterance_type
+  ) %>%
+  select(subject, age, utt_type, modality, duration_sec, semantic_cat, language)
+
+# Prepare hearing data
+hearing_all_clean <- hearing_all %>%
+  mutate(
+    language = "English",
+    subject = as.character(subject)
+  ) %>%
+  select(subject, age, utt_type, modality, duration_sec, semantic_cat, language)
+
+# Prepare homesign data
+homesign_points_clean <- homesign_points %>%
+  mutate(
+    language = "Homesign",
+    modality = "Points"
+  ) %>%
+  rename(
+    duration_sec = `Duration...ss.msec`,
+    utt_type = Utterance_type
+  ) %>%
+  select(subject = Subject, age, utt_type, modality, duration_sec, language, semantic_cat)
+
+# Combine all datasets into one unified dataframe
+combined_df <- bind_rows(hearing_all_clean, deaf_points_clean, homesign_points_clean) %>%
+  mutate(
+    # Final standardization of age format
+    age = if_else(
+      grepl("^\\d+$", age),
+      paste(floor(as.numeric(age) / 12), sprintf("%02d", as.numeric(age) %% 12), sep = ";"),
+      age
+    ),
+    # Standardize utterance type names
+    utt_type = case_when(
+      utt_type == "point" ~ "point_alone",
+      utt_type == "Alone" ~ "point_alone",
+      TRUE ~ utt_type
+    )
+  )
+```
+
+# ============================================================================
+# SECTION 3: DESCRIPTIVE STATISTICS AND VISUALIZATIONS
+# ============================================================================
+
+
+```{r}
+### DATA PRESENCE TABLES
+## DEAF POINTS DATA PRESENCE
+presence_table_deaf <- deaf_points %>%
+  group_by(subject, age) %>%
+  summarise(present = "✓", .groups = 'drop') %>%
+  pivot_wider(names_from = age, values_from = present, names_sort = TRUE)
+kable(presence_table_deaf,
+      caption = "ASL Data Availability",
+      align = "c", format = "html",
+      table.attr = "style='border-collapse: collapse; border: 1px solid black; margin: 0 auto;'") %>%
+  gsub("NA", "", .) %>%
+  gsub("<td ", "<td style='border: 1px solid black; padding: 8px; text-align: center;' ", .) %>%
+  gsub("<th ", "<th style='border: 1px solid black; padding: 8px; text-align: center; background-color: #f0f0f0;' ", .)
+
+## HOMESIGN DATA PRESENCE
+presence_table_homesign <- homesign_points %>%
+  group_by(Subject, Age) %>%
+  summarise(present = "✓", .groups = 'drop') %>%
+  pivot_wider(names_from = Age, values_from = present, names_sort = TRUE)
+kable(presence_table_homesign,
+      caption = "Homesign Data Availability",
+      align = "c", format = "html",
+      table.attr = "style='border-collapse: collapse; border: 1px solid black; margin: 0 auto;'") %>%
+  gsub("NA", "", .) %>%
+  gsub("<td ", "<td style='border: 1px solid black; padding: 8px; text-align: center;' ", .) %>%
+  gsub("<th ", "<th style='border: 1px solid black; padding: 8px; text-align: center; background-color: #f0f0f0;' ", .)
+
+### SUMMARY TABLES BY AGE AND GROUP
+## HELPER FUNCTION: FORMAT AGE FOR DISPLAY
+format_age <- function(age) {
+  if(is.numeric(age)) {
+    years <- floor(age)
+    months <- round((age - years) * 12)
+    return(paste0(years, ";", sprintf("%02d", months)))
+  } else {
+    return(age)
+  }
+}
+
+## HELPER FUNCTION: CREATE GROUP SUMMARY DATA
+create_group_summary <- function(data, subject_col, age_col, group_name, averaged = FALSE) {
+  subject_col <- sym(subject_col)
+  age_col <- sym(age_col)
+
+  if (averaged) {
+    # Calculate mean points per subject within each age
+    summary_data <- data %>%
+      group_by(!!age_col, !!subject_col) %>%
+      summarise(points_per_subject = n(), .groups = 'drop') %>%
+      group_by(!!age_col) %>%
+      summarise(
+        n_children = n_distinct(!!subject_col),
+        value = round(mean(points_per_subject), 1),
+        .groups = 'drop'
+      )
+  } else {
+    # Calculate total children and total points per age
+    summary_data <- data %>%
+      group_by(!!age_col) %>%
+      summarise(
+        n_children = n_distinct(!!subject_col),
+        value = n(),
+        .groups = 'drop'
+      )
+  }
+
+  summary_data %>%
+    mutate(
+      age_formatted = sapply(!!age_col, format_age),
+      group = group_name,
+      display = paste0(n_children, " (", value, ")")
+    ) %>%
+    select(age = !!age_col, age_formatted, group, display, value, n_children)
+}
+
+## TOTALS TABLE: CHILDREN AND TOTAL POINTS PRODUCED
+# Process English-learners (hearing children learning English)
+english_summary <- hearing_all_clean %>%
+  filter(modality == "Points") %>%
+  create_group_summary("subject", "age", "English-learners", averaged = FALSE)
+
+# Process ASL-learners (deaf children learning American Sign Language)
+asl_summary <- deaf_points %>%
+  create_group_summary("subject", "age", "ASL-learners", averaged = FALSE)
+
+# Process Homesigners (deaf children not exposed to conventional sign language)
+homesign_summary <- homesign_points %>%
+  create_group_summary("Subject", "Age", "Homesigners", averaged = FALSE)
+
+# Add individual homesigner breakdowns with indentation
+homesign_individuals <- homesign_points %>%
+  group_by(Subject, Age) %>%
+  summarise(n_points = n(), .groups = 'drop') %>%
+  mutate(
+    age_formatted = sapply(Age, format_age),
+    group = paste0("    → ", Subject),
+    display = paste0("1 (", n_points, ")"),
+    value = n_points,
+    n_children = 1
+  ) %>%
+  select(age = Age, age_formatted, group, display, value, n_children)
+
+# Combine all data
+all_summary <- bind_rows(english_summary, asl_summary, homesign_summary, homesign_individuals)
+
+# Create wide format table
+all_ages <- sort(unique(all_summary$age))
+age_labels <- sapply(all_ages, format_age)
+
+summary_table <- all_summary %>%
+  select(group, age_formatted, display) %>%
+  pivot_wider(names_from = age_formatted, values_from = display, values_fill = "") %>%
+  left_join(
+    all_summary %>%
+      group_by(group) %>%
+      summarise(total_points = sum(value), .groups = 'drop'),
+    by = "group"
+  )
+
+# Format and display totals table
+summary_table %>%
+  left_join(
+    # Calculate mean points per child for each group
+    bind_rows(
+      # English-learners: mean points per individual child (count rows)
+      hearing_all_clean %>%
+        filter(modality == "Points") %>%
+        group_by(subject) %>%
+        summarise(child_total_points = n(), .groups = 'drop') %>%  # Count rows instead of sum(value)
+        summarise(group = "English-learners",
+                  mean_points_per_child = round(mean(child_total_points, na.rm = TRUE), 0)),
+
+      # ASL-learners: mean points per individual child (count rows)
+      deaf_points_clean %>%  # Using deaf_points_clean based on your colnames() call
+        filter(modality == "Points") %>%
+        group_by(subject) %>%
+        summarise(child_total_points = n(), .groups = 'drop') %>%  # Count rows instead of sum(value)
+        summarise(group = "ASL-learners",
+                  mean_points_per_child = round(mean(child_total_points, na.rm = TRUE), 0)),
+
+      # Homesigners: mean points per individual child (count rows)
+      homesign_points %>%
+        group_by(Subject) %>%
+        summarise(child_total_points = n(), .groups = 'drop') %>%  # Count rows instead of sum(value)
+        summarise(group = "Homesigners",
+                  mean_points_per_child = round(mean(child_total_points, na.rm = TRUE), 0))
+    ),
+    by = "group"
+  ) %>%
+  kable(
+    caption = "Table 1. Number of children in each group observed at each session and (in parentheses) number of points produced",
+    align = c("l", rep("c", length(age_labels)), "c", "c"),
+    col.names = c("Child Group", age_labels, "Total Points", "Mean Points per Child"),
+    format = "html"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  add_header_above(c(" " = 1, "Age at Observation (years;months)" = length(age_labels), " " = 2)) %>%
+  column_spec(1, bold = TRUE) %>%
+  row_spec(0, bold = TRUE, background = "#f0f0f0") %>%
+  row_spec(which(grepl("→", summary_table$group)),
+           italic = TRUE, color = "#888888", background = "#f5f5f5") %>%
+  footnote(
+    general = "* The English-learners were observed at the ages listed in the table; because of the difficulty of scheduling the ASL-learners and Homesigners, they were visited sometime  within the 4-month intervals (on occasion, a child was observed twice within this interval)We extended the observation period for homesigners because they can be delayed by as much as a year (e.g., Morford & Goldin-Meadow, 1997) ",
+    general_title = "Note: "
+  )
+```
+
+```{r redundancy-analysis}
+# Analyze point redundancy in hearing children (preliminary descriptive analysis)
+pt_redundancy_stats <- hearing_all %>%
+  filter(modality == "Points") %>%
+  mutate(pt_redundancy = case_when(
+    pt_redundancy %in% c("Redundant with Pronoun", "Redundant with Other PoS") ~ "Redundant",
+    pt_redundancy == "unclear" ~ NA_character_,
+    TRUE ~ pt_redundancy
+  )) %>%
+  filter(!is.na(pt_redundancy)) %>%
+  group_by(subject, age, pt_redundancy) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(pt_redundancy) %>%
+  summarise(
+    mean_count = mean(count),
+    sd_count = sd(count),
+    total_count = sum(count),
+    .groups = "drop"
+  ) %>%
+  mutate(percentage = 100 * total_count / sum(total_count))
+
+# Create formatted kable table with HTML formatting
+kable(pt_redundancy_stats,
+      caption = "Redundancy of Point Gestures for Hearing Children",
+      digits = 2,
+      align = "c",
+      format = "html",
+      table.attr = "style='border-collapse: collapse; border: 1px solid black; margin: 0 auto;'") %>%
+  gsub("<td ", "<td style='border: 1px solid black; padding: 8px; text-align: center;' ", .) %>%
+  gsub("<th ", "<th style='border: 1px solid black; padding: 8px; text-align: center; background-color: #f0f0f0;' ", .)
+
+```
+
+```{r multiword-analysis}
+###HEARING
+# Create the proportion table
+proportion_table <- hearing_all %>%
+  # Create binary variable for single word (1) vs multi-word (>1)
+  mutate(single_word = ifelse(number_of_words == 1, 1, 0)) %>%
+  # Group by subject and age
+  group_by(subject, age) %>%
+  # Calculate proportion of multi-word utterances as percentage
+  summarise(
+    prop_multi_word = (1 - mean(single_word, na.rm = TRUE)) * 100,
+    .groups = 'drop'
+  ) %>%
+  # Pivot to wide format with subjects as rows, ages as columns
+  pivot_wider(
+    names_from = age,
+    values_from = prop_multi_word
+  ) %>%
+  # Round to 1 decimal place for clean display
+  mutate(across(-subject, ~ round(.x, 1)))
+
+# Create formatted kable table with HTML formatting
+kable(proportion_table,
+      caption = "English Group: Percentage of multiword utterances",
+      digits = 1,
+      align = "c",
+      format = "html",
+      table.attr = "style='border-collapse: collapse; border: 1px solid black; margin: 0 auto;'") %>%
+  gsub("<td ", "<td style='border: 1px solid black; padding: 8px; text-align: center;' ", .) %>%
+  gsub("<th ", "<th style='border: 1px solid black; padding: 8px; text-align: center; background-color: #f0f0f0;' ", .)
+
+
+### DEAF
+# Create the proportion table
+proportion_table <- deaf_points %>%
+  # Filter to only include "Alone" and "Multi-sign_utterance" types
+  filter(utterance_type %in% c("Alone", "Multi-sign_utterance")) %>%
+  # Create binary variable for multi-sign utterances
+  mutate(multi_sign = ifelse(utterance_type == "Multi-sign_utterance", 1, 0)) %>%
+  # Group by subject and age
+  group_by(subject, age) %>%
+  # Calculate proportion of multi-sign utterances as percentage
+  summarise(
+    prop_multi_sign = mean(multi_sign, na.rm = TRUE) * 100,
+    .groups = 'drop'
+  ) %>%
+  # Pivot to wide format with subjects as rows, ages as columns
+  pivot_wider(
+    names_from = age,
+    values_from = prop_multi_sign
+  ) %>%
+  # Round to 1 decimal place for clean display
+  mutate(across(-subject, ~ round(.x, 1)))
+
+# Create formatted kable table with HTML formatting
+kable(proportion_table,
+      caption = "ASL Group: Percentage of Multi-sign Utterances",
+      digits = 1,
+      align = "c",
+      format = "html",
+      table.attr = "style='border-collapse: collapse; border: 1px solid black; margin: 0 auto;'") %>%
+  gsub("<td ", "<td style='border: 1px solid black; padding: 8px; text-align: center;' ", .) %>%
+  gsub("<th ", "<th style='border: 1px solid black; padding: 8px; text-align: center; background-color: #f0f0f0;' ", .)
+
+
+### HOMESIGN
+# Create the proportion table
+proportion_table <- homesign_points %>%
+  # Filter to only include "Alone" and "Multi-gesture utterance" types
+  filter(Utterance_type %in% c("Alone", "Multi-gesture utterance")) %>%
+  # Create binary variable for multi-gesture utterances
+  mutate(multi_gesture = ifelse(Utterance_type == "Multi-gesture utterance", 1, 0)) %>%
+  # Group by subject and age
+  group_by(Subject, Age) %>%
+  # Calculate proportion of multi-gesture utterances as percentage
+  summarise(
+    prop_multi_gesture = mean(multi_gesture, na.rm = TRUE) * 100,
+    .groups = 'drop'
+  ) %>%
+  # Pivot to wide format with subjects as rows, ages as columns
+  pivot_wider(
+    names_from = Age,
+    values_from = prop_multi_gesture,
+    names_sort = TRUE
+  ) %>%
+  # Round to 1 decimal place for clean display
+  mutate(across(-Subject, ~ round(.x, 1)))
+
+# Create formatted kable table with HTML formatting
+kable(proportion_table,
+      caption = "Homesign Group: Percentage of Multi-gesture utterances",
+      digits = 1,
+      align = "c",
+      format = "html",
+      table.attr = "style='border-collapse: collapse; border: 1px solid black; margin: 0 auto;'") %>%
+  gsub("NA", "", .) %>%  # Replace NA with blank
+  gsub("<td ", "<td style='border: 1px solid black; padding: 8px; text-align: center;' ", .) %>%
+  gsub("<th ", "<th style='border: 1px solid black; padding: 8px; text-align: center; background-color: #f0f0f0;' ", .)
+```
+
+
+```{r basic-plots}
+# VISUALIZATION 1: Overall counts by language group
+count_data <- combined_df %>%
+  group_by(subject, age, modality, language) %>%
+  summarise(count = n(), .groups = "drop")
+
+avg_data <- count_data %>%
+  group_by(language, modality) %>%
+  summarise(avg_count = mean(count), .groups = "drop")
+
+plot1 <- ggplot(avg_data, aes(x = language, y = avg_count, fill = modality)) +
+  geom_bar(stat = "identity", na.rm = TRUE) +
+  labs(
+    title = "Average Count of Deictic References by Language",
+    x = "Language",
+    y = "Count (across subject-age combinations)"
+  ) +
+  scale_fill_discrete(na.translate = FALSE) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+print(plot1)
+
+# VISUALIZATION 2: Developmental patterns by age and language
+avg_data_age <- count_data %>%
+  group_by(language, modality, age) %>%
+  summarise(avg_count = mean(count), .groups = "drop") %>%
+  filter(!is.na(avg_count) & avg_count > 0) %>%
+  create_age_ordering()
+
+plot2 <- ggplot(avg_data_age, aes(x = age, y = avg_count, fill = modality)) +
+  geom_bar(stat = "identity", na.rm = TRUE) +
+  labs(
+    title = "Count of Deictic References by Language and Age",
+    x = "Age",
+    y = "Average Count (across subjects)"
+  ) +
+  scale_fill_discrete(na.translate = FALSE) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~ language, scales = "free_x")
+print(plot2)
+```
+
+```{r individual-subject-plots}
+# VISUALIZATION 3: Individual subject patterns for Homesign
+plot3 <- create_subject_semantic_plot(combined_df, "Homesign", "Homesign")
+print(plot3)
+
+# VISUALIZATION 3b: Individual subject patterns for ASL
+plot3_asl <- create_subject_semantic_plot(combined_df, "ASL", "ASL")
+print(plot3_asl)
+```
+
+
+```{r semantic-plots}
+# VISUALIZATION 4: Semantic category analysis grouped by subject-age-modality-language first, then average by target groups
+
+# Prepare semantic data for cross-language comparison
+semantic_data <- combined_df %>%
+  group_by(subject, age, modality, language, semantic_cat) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(language, modality, semantic_cat) %>%
+  summarise(avg_count = mean(count), .groups = "drop") %>%
+  filter(
+    !(language %in% c("ASL", "Homesign") & modality == "Pronouns"),
+    !language %in% c("unclear", "other", "Other"),
+    !is.na(language)
+  ) %>%
+  mutate(modality = as.character(modality))
+
+# Set semantic category factor levels for consistent ordering across all plots
+semantic_cat_levels <- c("actor", "patient", "recipient", "place", "instrument",
+                        "source", "entity", "possessor", "location", "unclear")
+semantic_data <- semantic_data %>%
+  mutate(semantic_cat = factor(semantic_cat, levels = semantic_cat_levels))
+
+# VISUALIZATION 4a: Semantic categories by combined language-modality (counts)
+# Create combined language-modality variable for detailed comparison
+semantic_data <- semantic_data %>%
+  mutate(
+    lang_mod = case_when(
+      language == "English" & modality == "Pronouns" ~ "English pronouns",
+      language == "English" & modality == "Points" ~ "English points",
+      language == "ASL" ~ "ASL",
+      language == "Homesign" ~ "Homesign",
+      TRUE ~ paste(language, modality)
+    ),
+    lang_mod = factor(lang_mod, levels = c("English pronouns", "English points", "ASL", "Homesign"))
+  )
+
+semantic_summary <- semantic_data %>%
+  group_by(lang_mod, semantic_cat) %>%
+  summarise(avg_count = sum(avg_count, na.rm = TRUE), .groups = "drop")
+
+plot4a <- ggplot(
+  subset(semantic_summary, !is.na(semantic_cat) & semantic_cat != "unclear"),
+  aes(x = lang_mod, y = avg_count, fill = semantic_cat)
+) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_discrete(name = "Semantic Category") +
+  labs(
+    title = "Counts of Semantic Categories by Language and Modality",
+    x = "Language and Modality",
+    y = "Average Count (across subject-age combinations)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(plot4a)
+
+# VISUALIZATION 4b: Semantic categories as proportions by language-modality
+plot4b <- ggplot(
+  subset(semantic_summary, !is.na(semantic_cat) & semantic_cat != "unclear"),
+  aes(x = lang_mod, y = avg_count, fill = semantic_cat)
+) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_discrete(name = "Semantic Category") +
+  labs(
+    title = "Proportions of Semantic Categories by Language and Modality",
+    x = "Language and Modality",
+    y = "Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(plot4b)
+
+# VISUALIZATION 4c: Semantic categories by language (counts)
+# Combine modalities within each language by summing their averages
+semantic_summary <- semantic_data %>%
+  group_by(language, semantic_cat) %>%
+  summarise(avg_count = sum(avg_count, na.rm = TRUE), .groups = "drop")
+
+plot4c <- ggplot(
+  subset(semantic_summary, !is.na(semantic_cat) & semantic_cat != "unclear"),
+  aes(x = language, y = avg_count, fill = semantic_cat)
+) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_discrete(name = "Semantic Category") +
+  labs(
+    title = "Counts of Semantic Categories by Language",
+    x = "Language",
+    y = "Average Count (across subject-age combinations)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(plot4c)
+
+# VISUALIZATION 4d: Semantic categories as proportions by language
+plot4d <- ggplot(
+  subset(semantic_summary, !is.na(semantic_cat) & semantic_cat != "unclear"),
+  aes(x = language, y = avg_count, fill = semantic_cat)
+) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_discrete(name = "Semantic Category") +
+  labs(
+    title = "Proportions of Semantic Categories by Language",
+    x = "Language",
+    y = "Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(plot4d)
+
+# VISUALIZATION 4e & 4f: three-way comparison for ASL similarity analysis
+# Research question: Is ASL more similar to English overall or English pronouns specifically?
+# Create three specific comparison groups using the established semantic_data
+
+# Group 1: All English data (sum of pronouns and points averages)
+english_all_data <- semantic_data %>%
+  filter(language == "English") %>%
+  group_by(semantic_cat) %>%
+  summarise(avg_count = sum(avg_count, na.rm = TRUE), .groups = "drop") %>%
+  mutate(x_category = "English Pronouns & Points")
+
+# Group 2: ASL data only
+asl_data <- semantic_data %>%
+  filter(language == "ASL") %>%
+  group_by(semantic_cat) %>%
+  summarise(avg_count = sum(avg_count, na.rm = TRUE), .groups = "drop") %>%
+  mutate(x_category = "ASL Points")
+
+# Group 3: English pronouns subset only
+english_pronouns_data <- semantic_data %>%
+  filter(language == "English" & modality == "Pronouns") %>%
+  group_by(semantic_cat) %>%
+  summarise(avg_count = sum(avg_count, na.rm = TRUE), .groups = "drop") %>%
+  mutate(x_category = "English Pronouns")
+
+# Combine datasets for three-way comparison and clean semantic categories
+custom_semantic_data <- bind_rows(english_all_data, asl_data, english_pronouns_data) %>%
+  filter(!is.na(semantic_cat) & semantic_cat != "unclear") %>%
+  mutate(
+    x_category = factor(x_category, levels = c("English Pronouns & Points", "ASL Points", "English Pronouns")),
+    semantic_cat = factor(semantic_cat, levels = semantic_cat_levels)
+  )
+
+# VISUALIZATION 4e: Three-way comparison (counts)
+plot4e <- ggplot(
+  custom_semantic_data,
+  aes(x = x_category, y = avg_count, fill = semantic_cat)
+) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_discrete(name = "Semantic Category") +
+  labs(
+    title = "Average Count of Semantic Categories: ASL vs. English Deictic System",
+    x = "Language Group",
+    y = "Average Count (across subject and age)"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+print(plot4e)
+
+# VISUALIZATION 4f: Three-way comparison (proportions)
+plot4f <- ggplot(
+  custom_semantic_data,
+  aes(x = x_category, y = avg_count, fill = semantic_cat)
+) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_discrete(name = "Semantic Category") +
+  labs(
+    title = "Proportions of Semantic Categories by Language Group:ASL vs. English Deictic System",
+    x = "Language Group",
+    y = "Proportion"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+
+print(plot4f)
+
+# VISUALIZATION 4g: Three-group comparison - English Points, ASL Points, Homesign Points
+# Create three specific comparison groups for pointing modalities only
+
+# Group 1: English Points only
+english_points_data <- semantic_data %>%
+  filter(language == "English" & modality == "Points") %>%
+  group_by(semantic_cat) %>%
+  summarise(avg_count = sum(avg_count, na.rm = TRUE), .groups = "drop") %>%
+  mutate(group_category = "English-learners")
+
+# Group 2: ASL Points only
+asl_points_data <- semantic_data %>%
+  filter(language == "ASL") %>%
+  group_by(semantic_cat) %>%
+  summarise(avg_count = sum(avg_count, na.rm = TRUE), .groups = "drop") %>%
+  mutate(group_category = "ASL-learners")
+
+# Group 3: Homesign Points only
+homesign_points_data <- semantic_data %>%
+  filter(language == "Homesign") %>%
+  group_by(semantic_cat) %>%
+  summarise(avg_count = sum(avg_count, na.rm = TRUE), .groups = "drop") %>%
+  mutate(group_category = "Homesigners")
+
+# Combine datasets for three-group comparison
+points_comparison_data <- bind_rows(english_points_data, asl_points_data, homesign_points_data) %>%
+  filter(!is.na(semantic_cat) & semantic_cat != "unclear") %>%
+  mutate(
+    # Set factor levels with ASL-learners in the middle
+    group_category = factor(group_category, levels = c("English-learners", "ASL-learners", "Homesigners")),
+    semantic_cat = factor(semantic_cat, levels = semantic_cat_levels)
+  )
+
+# VISUALIZATION 4g: Three-group pointing comparison (average counts)
+plot4g <- ggplot(
+  points_comparison_data,
+  aes(x = group_category, y = avg_count, fill = semantic_cat)
+) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +  # Use stack for counts, slightly narrower bars
+  scale_fill_discrete(name = "Semantic Category") +
+  labs(
+    x = "",  # Remove x-axis label
+    y = "Average Count"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 16, angle = 70, hjust = 1, vjust = 1),  # Angled labels positioned closer to axis
+    axis.text.y = element_text(size = 16),  # Increase y-axis text size
+    axis.title.y = element_text(size = 18),  # Increase y-axis title size
+    legend.text = element_text(size = 16),  # Increase legend text size
+    legend.title = element_text(size = 18),  # Increase legend title size
+    plot.title = element_blank(),  # Remove the title completely
+    aspect.ratio = 1.2,  # Stretch the plot vertically
+    panel.background = element_rect(fill = "white", color = NA),  # White background
+    plot.background = element_rect(fill = "white", color = NA),   # White plot background
+    plot.margin = margin(t = 10, r = 10, b = 5, l = 10)  # Reduce bottom margin to bring labels closer
+  ) +
+  coord_cartesian(expand = FALSE)  # Remove extra space around plot
+
+
+
+
+```
+
+```{r verify-item3-semantic-logistic}
+# VERIFY Item 3: Mixed-effects logistic regression on semantic category use
+# Tests whether language group predicts entity vs. other pointing.
+# Manuscript reports: N = 4,043, chi2(2) = 4.79, p = 0.091
+# Random intercepts for participant and age (age treated as factor grouping variable).
+
+sem_log_data <- combined_df %>%
+  filter(modality == "Points", !is.na(language), !is.na(semantic_cat),
+         semantic_cat != "unclear") %>%
+  mutate(
+    language_group = factor(case_when(
+      language == "English"  ~ "English-learners",
+      language == "ASL"      ~ "ASL-learners",
+      language == "Homesign" ~ "Homesigners"
+    ), levels = c("English-learners", "ASL-learners", "Homesigners")),
+    entity_bin = as.integer(semantic_cat == "entity"),
+    subject    = factor(subject),
+    age_fac    = factor(age)
+  ) %>%
+  filter(!is.na(language_group))
+
+cat("=== VERIFY Item 3: Semantic Logistic Regression ===\n\n")
+cat("Sample sizes (unclear excluded):\n")
+sem_log_data %>%
+  group_by(language_group) %>%
+  summarise(N = n(), subjects = n_distinct(subject), .groups = "drop") %>%
+  print()
+cat("Total N:", nrow(sem_log_data), "\n\n")
+
+sem_log_null <- glmer(entity_bin ~ (1 | subject) + (1 | age_fac),
+                      data = sem_log_data, family = binomial,
+                      control = glmerControl(optimizer = "bobyqa"))
+sem_log_full <- glmer(entity_bin ~ language_group + (1 | subject) + (1 | age_fac),
+                      data = sem_log_data, family = binomial,
+                      control = glmerControl(optimizer = "bobyqa"))
+
+cat("Likelihood ratio test (null vs. full model with language group):\n")
+print(anova(sem_log_null, sem_log_full))
+```
+
+
+```{r developmental-semantic}
+# VISUALIZATION 5: Developmental patterns in semantic categories
+
+# Create developmental semantic data
+semantic_data_developmental <- combined_df %>%
+  group_by(subject, age, modality, language, semantic_cat) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(language, modality, semantic_cat, age) %>%
+  summarise(avg_count = mean(count), .groups = "drop") %>%
+  filter(
+    !(language %in% c("ASL", "Homesign") & modality == "Pronouns"),
+    !language %in% c("unclear", "other", "Other"),
+    !is.na(language)
+  ) %>%
+  mutate(modality = as.character(modality))
+
+# Create language-modality combinations
+semantic_data_split_mods <- semantic_data_developmental %>%
+  mutate(
+    language_mod = case_when(
+      language == "English" & modality == "Points" ~ "English – Points",
+      language == "English" & modality == "Pronouns" ~ "English – Pronouns",
+      TRUE ~ language
+    )
+  )
+
+plot4d_dev <- ggplot(
+  subset(semantic_data_split_mods,
+         !is.na(semantic_cat) & semantic_cat != "unclear" &
+         !(semantic_cat %in% c("other")) &
+         !(language %in% c("ASL", "Homesign") & modality == "Pronouns")),
+  aes(x = age, y = avg_count, fill = semantic_cat)
+) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~ language_mod, scales = "free_x") +
+  scale_fill_discrete(na.translate = FALSE) +
+  labs(
+    title = "Count of Semantic Categories by Age and Language-Modality",
+    x = "Age",
+    y = "Average Count (across subjects)",
+    fill = "Semantic Category"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 11)
+  )
+print(plot4d_dev)
+```
+
+```{r collapsed-semantic}
+# VISUALIZATION 6: Collapsed semantic categories (Action vs Static)
+
+semantic_data_split_mods_collapsed <- semantic_data_split_mods %>%
+  mutate(
+    semantic_cat_collapsed = case_when(
+      semantic_cat %in% c("actor", "instrument", "patient", "place", "recipient", "source") ~ "Action",
+      semantic_cat %in% c("entity", "possessor", "location", "picture") ~ "Static",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  filter(semantic_cat_collapsed != "Other") %>%
+  group_by(language_mod, age, semantic_cat_collapsed) %>%
+  summarise(avg_count = sum(avg_count), .groups = "drop")
+
+plot4d_collapsed <- ggplot(
+  subset(semantic_data_split_mods_collapsed, !is.na(semantic_cat_collapsed)),
+  aes(x = age, y = avg_count, fill = semantic_cat_collapsed)
+) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~ language_mod, scales = "free_x") +
+  scale_fill_manual(values = c("Action" = "coral", "Static" = "lightblue")) +
+  labs(
+    title = "Count of Collapsed Semantic Categories by Age and Language-Modality",
+    x = "Age",
+    y = "Average Count (across subjects)",
+    fill = "Semantic Category"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 11)
+  )
+print(plot4d_collapsed)
+```
+
+
+```{r duration-analysisc}
+# VISUALIZATION 7-12:
+
+# Set consistent y-axis limits across all plots
+y_limits <- c(0, 1.0)
+
+# =============================================================================
+# OVERALL DURATION DISTRIBUTIONS (ALL AGES COMBINED)
+# =============================================================================
+
+# Calculate summary statistics for each language (across all ages)
+duration_stats <- combined_df %>%
+  group_by(language) %>%
+  summarize(
+    mean_duration = mean(duration_sec, na.rm = TRUE),
+    sd_duration = sd(duration_sec, na.rm = TRUE)
+  )
+
+# Create overall density plot showing language differences
+plot5_overall <- ggplot(combined_df, aes(x = duration_sec, fill = language, color = language)) +
+  geom_density(alpha = 0.3) +
+  geom_vline(data = duration_stats, aes(xintercept = mean_duration, color = language),
+             linetype = "dashed", size = 1) +
+  labs(
+    title = "Density Distribution of Duration by Language",
+    x = "Duration (seconds)",
+    y = "Density",
+    color = "Language\n(Mean ± SD)",
+    fill = "Language\n(Mean ± SD)"
+  ) +
+  scale_color_manual(
+    values = scales::hue_pal()(nrow(duration_stats)),
+    labels = paste(duration_stats$language,
+                   "Mean:", round(duration_stats$mean_duration, 2),
+                   "SD:", round(duration_stats$sd_duration, 2))
+  ) +
+  scale_fill_manual(
+    values = scales::hue_pal()(nrow(duration_stats)),
+    labels = paste(duration_stats$language,
+                   "Mean:", round(duration_stats$mean_duration, 2),
+                   "SD:", round(duration_stats$sd_duration, 2))
+  ) +
+  xlim(0, 8) +
+  ylim(0, 0.8)
+
+print(plot5_overall)
+
+# Create overall density plot showing language differences (version for paper)
+plot5a_overall <- ggplot(combined_df, aes(x = duration_sec, fill = language, color = language)) +
+  geom_density(alpha = 0.3) +
+  geom_vline(data = duration_stats, aes(xintercept = mean_duration, color = language),
+             linetype = "dashed", size = 1) +
+  labs(
+    x = "Duration (seconds)",
+    y = "Density"
+  ) +
+  scale_color_manual(
+    values = scales::hue_pal()(3),
+    breaks = c("English", "ASL", "Homesign"),
+    labels = c("English-learners", "ASL-learners", "Homesigners")
+  ) +
+  scale_fill_manual(
+    values = scales::hue_pal()(3),
+    breaks = c("English", "ASL", "Homesign"),
+    labels = c("English-learners", "ASL-learners", "Homesigners")
+  ) +
+  xlim(0, 8) +
+  ylim(0, 0.8) +
+  theme_bw() +  # White background theme
+  theme(
+    text = element_text(size = 17),           # All text size 16
+    axis.text = element_text(size = 17),      # Axis text size 16
+    axis.title = element_text(size = 17),     # Axis titles size 16
+    legend.text = element_text(size = 17),    # Legend text size 16
+    legend.title = element_blank(),           # Remove legend title
+    legend.key.height = unit(1.2, "lines"),  # Height of each legend key
+    legend.key.width = unit(1.2, "lines")    # Width of each legend key
+  ) +
+  guides(
+    color = guide_legend(keyheight = 1.5),    # Increase spacing between legend items
+    fill = guide_legend(keyheight = 1.5)
+  )
+print(plot5a_overall)
+
+
+
+# =============================================================================
+# DEVELOPMENTAL DURATION DISTRIBUTIONS (BY AGE)
+# =============================================================================
+
+# Calculate age-specific duration statistics for each language
+# This shows how duration changes developmentally within each language
+duration_stats_by_age <- combined_df %>%
+  filter(!is.na(duration_sec)) %>%  # Remove rows with missing duration data
+  group_by(language, age) %>%
+  summarise(
+    mean_duration = mean(duration_sec, na.rm = TRUE),
+    sd_duration = sd(duration_sec, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  filter(!is.na(mean_duration))  # Remove any language-age combinations with no valid data
+
+# Create developmental density plot with separate panels for each age
+plot5_developmental <- ggplot(combined_df %>% filter(!is.na(duration_sec)),
+                             aes(x = duration_sec, fill = language, color = language)) +
+  geom_density(alpha = 0.3) +
+  # Add vertical lines showing age-specific means for each language
+  geom_vline(data = duration_stats_by_age, aes(xintercept = mean_duration, color = language),
+             linetype = "dashed", size = 1) +
+  facet_grid(age ~ .) +  # Create separate panels stacked vertically by age
+  labs(
+    title = "Developmental Changes in Duration Distribution by Language and Age",
+    x = "Duration (seconds)",
+    y = "Density",
+    color = "Language",
+    fill = "Language"
+  ) +
+  # Create legend labels showing age-specific means and SDs for each language
+  scale_color_manual(
+    values = scales::hue_pal()(length(unique(combined_df$language))),
+    labels = function(x) {
+      sapply(x, function(lang) {
+        age_stats <- duration_stats_by_age[duration_stats_by_age$language == lang, ]
+        paste0(lang, "\n", paste(
+          paste("Age", age_stats$age, ":",
+                "M=", round(age_stats$mean_duration, 2),
+                "SD=", round(age_stats$sd_duration, 2)),
+          collapse = "\n"
+        ))
+      })
+    }
+  ) +
+  scale_fill_manual(
+    values = scales::hue_pal()(length(unique(combined_df$language))),
+    labels = function(x) {
+      sapply(x, function(lang) {
+        age_stats <- duration_stats_by_age[duration_stats_by_age$language == lang, ]
+        paste0(lang, "\n", paste(
+          paste("Age", age_stats$age, ":",
+                "M=", round(age_stats$mean_duration, 2),
+                "SD=", round(age_stats$sd_duration, 2)),
+          collapse = "\n"
+        ))
+      })
+    }
+  ) +
+  xlim(0, 8) +
+  ylim(0, 1)
+
+print(plot5_developmental)
+
+# =============================================================================
+# POINT ALONE DURATION DISTRIBUTIONS
+# =============================================================================
+
+# Filter data to include only pointing gestures without accompanying speech/signs
+point_alone_data <- combined_df %>%
+  filter(utt_type == "point_alone")
+
+# Calculate summary statistics for point-alone gestures by language
+point_alone_stats <- point_alone_data %>%
+  group_by(language) %>%
+  summarise(
+    mean_duration = mean(duration_sec, na.rm = TRUE),
+    sd_duration   = sd(duration_sec, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Create density plot for point-alone gestures only
+plot6 <- ggplot(point_alone_data, aes(x = duration_sec, fill = language, color = language)) +
+  geom_density(alpha = 0.3) +
+  geom_vline(
+    data = point_alone_stats,
+    aes(xintercept = mean_duration, color = language),
+    linetype = "dashed", size = 1
+  ) +
+  labs(
+    title = "Density Distribution of Duration by Language (Point Alone Only)",
+    x = "Duration (seconds)",
+    y = "Density",
+    color = "Language\n(Mean ± SD)",
+    fill  = "Language\n(Mean ± SD)"
+  ) +
+  scale_color_manual(
+    values = scales::hue_pal()(nrow(point_alone_stats)),
+    labels = paste(
+      point_alone_stats$language,
+      "Mean:", round(point_alone_stats$mean_duration, 2),
+      "SD:", round(point_alone_stats$sd_duration, 2)
+    )
+  ) +
+  scale_fill_manual(
+    values = scales::hue_pal()(nrow(point_alone_stats)),
+    labels = paste(
+      point_alone_stats$language,
+      "Mean:", round(point_alone_stats$mean_duration, 2),
+      "SD:", round(point_alone_stats$sd_duration, 2)
+    )
+  ) +
+  xlim(0, 8) +
+  ylim(0, 0.8)
+
+print(plot6)
+```
+
+```{r}
+# ---- Create entity_group (entity vs. other), excluding NA/unclear semantic categories ----
+combined_df_clean <- combined_df %>%
+  filter(!is.na(semantic_cat) & semantic_cat != "unclear") %>%
+  mutate(entity_group = if_else(semantic_cat == "entity", "entity", "other"))
+
+# ---- Overall point duration: density by language, faceted by entity_group ----
+# Compute summary statistics for each language and entity group
+summary_lang_entity <- combined_df_clean %>%
+  filter(modality == "Points", !is.na(duration_sec)) %>%
+  group_by(entity_group, language) %>%
+  summarise(mean_dur = mean(duration_sec, na.rm = TRUE),
+            sd_dur   = sd(duration_sec, na.rm = TRUE),
+            .groups = "drop") %>%
+  # Create vertical positions for text labels (stacked within each facet)
+  group_by(entity_group) %>%
+  mutate(y_pos = seq(0.85, 0.55, length.out = n())) %>%
+  ungroup()
+
+plot5_lang_entity <- combined_df_clean %>%
+  filter(modality == "Points", !is.na(duration_sec)) %>%
+  ggplot(aes(x = duration_sec, fill = language, color = language)) +
+  geom_density(alpha = 0.4, size = 0.5) +
+  geom_vline(data = summary_lang_entity,
+             aes(xintercept = mean_dur, color = language),
+             linetype = "dashed", size = 0.6) +
+  geom_text(data = summary_lang_entity,
+            aes(x = 7, y = y_pos,
+                label = paste0(language, ": M=", round(mean_dur,2), "  SD=", round(sd_dur,2))),
+            hjust = 1, size = 3, inherit.aes = FALSE, check_overlap = TRUE) +
+  scale_fill_manual(values = c("English" = "#F8766D", "ASL" = "#00BA38", "Homesign" = "#619CFF"),
+                    name = "Language") +
+  scale_color_manual(values = c("English" = "#F8766D", "ASL" = "#00BA38", "Homesign" = "#619CFF"),
+                     name = "Language") +
+  facet_wrap(~ entity_group, ncol = 1) +
+  labs(title = "Duration of all points",
+       x = "Duration (seconds)", y = "Density") +
+  xlim(0, 8) + ylim(0, 1) +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "bold"),
+        legend.position = "right")
+
+print(plot5_lang_entity)
+
+# ---- Points‑alone duration: density by language, faceted by entity_group ----
+points_alone_df <- combined_df_clean %>%
+  filter(utt_type == "point_alone", !is.na(duration_sec))
+
+summary_points_alone_lang <- points_alone_df %>%
+  group_by(entity_group, language) %>%
+  summarise(mean_dur = mean(duration_sec, na.rm = TRUE),
+            sd_dur   = sd(duration_sec, na.rm = TRUE),
+            .groups = "drop") %>%
+  group_by(entity_group) %>%
+  mutate(y_pos = seq(0.85, 0.55, length.out = n())) %>%
+  ungroup()
+
+plot6_lang_entity <- points_alone_df %>%
+  ggplot(aes(x = duration_sec, fill = language, color = language)) +
+  geom_density(alpha = 0.4, size = 0.5) +
+  geom_vline(data = summary_points_alone_lang,
+             aes(xintercept = mean_dur, color = language),
+             linetype = "dashed", size = 0.6) +
+  geom_text(data = summary_points_alone_lang,
+            aes(x = 7, y = y_pos,
+                label = paste0(language, ": M=", round(mean_dur,2), "  SD=", round(sd_dur,2))),
+            hjust = 1, size = 3, inherit.aes = FALSE, check_overlap = TRUE) +
+  scale_fill_manual(values = c("English" = "#F8766D", "ASL" = "#00BA38", "Homesign" = "#619CFF"),
+                    name = "Language") +
+  scale_color_manual(values = c("English" = "#F8766D", "ASL" = "#00BA38", "Homesign" = "#619CFF"),
+                     name = "Language") +
+  facet_wrap(~ entity_group, ncol = 1) +
+  labs(title = "Duration of Alone Points",
+       x = "Duration (seconds)", y = "Density") +
+  xlim(0, 8) + ylim(0, 1) +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 12, face = "bold"),
+        legend.position = "right")
+
+print(plot6_lang_entity)
+```
+
+
+
+```{r}
+# =============================================================================
+# DETAILED DURATION PLOTS BY AGE AND LANGUAGE
+# =============================================================================
+# Simplified density plot function with mean and SD labels
+create_density_plot <- function(data, group_vars, fill_color, y_limits = c(0, 1.0), plot_type = "general") {
+
+  # Apply custom labels based on plot type
+  plot_data <- data
+  if (plot_type == "ASL") {
+    plot_data <- plot_data %>%
+      mutate(subject = paste0("ASL", as.numeric(as.factor(subject))))
+  } else if (plot_type == "Homesign") {
+    plot_data <- plot_data %>%
+      mutate(subject = paste0("HS", as.numeric(as.factor(subject))))
+  } else if (plot_type == "general") {
+    plot_data <- plot_data %>%
+      mutate(language = case_when(
+        language == "English" ~ "English-learners",
+        language == "ASL" ~ "ASL-learners",
+        language == "Homesign" ~ "Homesigners",
+        TRUE ~ language
+      ))
+  }
+
+  # Calculate the maximum density to set appropriate y-limits
+  max_density <- plot_data %>%
+    filter(!is.na(duration_sec)) %>%  # Remove missing values
+    group_by(across(all_of(group_vars))) %>%
+    do({
+      clean_data <- .$duration_sec[!is.na(.$duration_sec)]
+      if(length(clean_data) > 1) {
+        dens <- density(clean_data, from = 0, to = 6)
+        data.frame(max_dens = max(dens$y))
+      } else {
+        data.frame(max_dens = 0)
+      }
+    }) %>%
+    pull(max_dens) %>%
+    max(na.rm = TRUE)
+
+  # Set y_limits to accommodate the highest density, with some padding
+  y_limits_auto <- c(0, max(1.0, max_density * 1.1))
+
+  # Calculate session means (remove NA values)
+  session_stats <- plot_data %>%
+    filter(!is.na(duration_sec)) %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(session_mean = mean(duration_sec, na.rm = TRUE), .groups = 'drop')
+
+  # Calculate mean and SD for each facet (only for facets with data)
+  facet_stats <- plot_data %>%
+    filter(!is.na(duration_sec)) %>%
+    group_by(across(all_of(group_vars))) %>%
+    summarise(
+      mean_val = mean(duration_sec, na.rm = TRUE),
+      sd_val = sd(duration_sec, na.rm = TRUE),
+      n_obs = n(),
+      .groups = 'drop'
+    ) %>%
+    filter(n_obs > 0) %>%  # Only keep facets with data
+    mutate(
+      stats_label = paste0("M = ", round(mean_val, 2), "\nSD = ", round(sd_val, 2))
+    )
+
+  # Base plot
+  p <- ggplot(plot_data, aes(x = duration_sec)) +
+    geom_density(fill = fill_color, alpha = 0.5, color = NA) +
+    facet_grid(reformulate(group_vars[2], group_vars[1]), drop = TRUE) +
+    labs(x = "Duration (seconds)", y = "Density") +
+    theme_bw() +
+    theme(
+      strip.text = element_text(size = 10, face = "bold"),
+      panel.spacing = unit(0.5, "lines")
+    ) +
+    xlim(0, 6) +
+    scale_y_continuous(breaks = c(0, 0.5, 1), limits = y_limits_auto)
+
+  # Add mean and SD text labels (only for facets with data)
+  p <- p + geom_text(data = facet_stats,
+                     aes(x = 4.5, y = y_limits_auto[2] * 0.8, label = stats_label),
+                     hjust = 0, vjust = 1, size = 3, color = "black")
+
+  # Add reference lines based on plot type
+  if (plot_type == "general") {
+    # Royal blue 1: session means for each age-language combination
+    p <- p +
+      geom_vline(data = session_stats, aes(xintercept = session_mean),
+                 linetype = "dotted", size = 0.8, color = "royalblue1")
+
+    # Black: overall means for each language across all sessions
+    overall_language_means <- plot_data %>%
+      filter(!is.na(duration_sec)) %>%
+      group_by(across(all_of(group_vars[2]))) %>%  # group by language only
+      summarise(overall_mean = mean(duration_sec, na.rm = TRUE), .groups = 'drop')
+
+    # Expand to all existing age-language combinations
+    existing_combos <- plot_data %>%
+      filter(!is.na(duration_sec)) %>%
+      group_by(across(all_of(group_vars))) %>%
+      summarise(n_obs = n(), .groups = 'drop') %>%
+      filter(n_obs > 0)
+
+    overall_stats <- existing_combos %>%
+      select(all_of(group_vars)) %>%
+      left_join(overall_language_means, by = group_vars[2])
+
+    p <- p + geom_vline(data = overall_stats, aes(xintercept = overall_mean),
+                       linetype = "dotted", size = 0.8, color = "black")
+
+  } else if (plot_type == "ASL") {
+    # Royal blue 1: mean for each age-subject facet
+    p <- p +
+      geom_vline(data = session_stats, aes(xintercept = session_mean),
+                 linetype = "dotted", size = 0.8, color = "royalblue1")
+
+    # Black: mean for ASL-learners at each age (across all subjects)
+    asl_age_means <- plot_data %>%
+      filter(!is.na(duration_sec)) %>%
+      group_by(across(all_of(group_vars[1]))) %>%  # group by age only
+      summarise(age_mean = mean(duration_sec, na.rm = TRUE), .groups = 'drop')
+
+    # Expand to all existing age-subject combinations
+    existing_combos <- plot_data %>%
+      filter(!is.na(duration_sec)) %>%
+      group_by(across(all_of(group_vars))) %>%
+      summarise(n_obs = n(), .groups = 'drop') %>%
+      filter(n_obs > 0)
+
+    age_stats <- existing_combos %>%
+      select(all_of(group_vars)) %>%
+      left_join(asl_age_means, by = group_vars[1])
+
+    p <- p + geom_vline(data = age_stats, aes(xintercept = age_mean),
+                       linetype = "dotted", size = 0.8, color = "black")
+
+  } else if (plot_type == "Homesign") {
+    # Royal blue 1: mean for each age-subject facet
+    p <- p +
+      geom_vline(data = session_stats, aes(xintercept = session_mean),
+                 linetype = "dotted", size = 0.8, color = "royalblue1")
+  }
+
+  return(p)
+}
+
+# Function to save plots
+save_plot <- function(plot_obj, filename) {
+  ggsave(paste0("/Users/jessbreeze/Library/CloudStorage/Box-Box/Pointing project 2025/analysis/TEMP_PP_sanity_check_Aug25/plots/", filename, ".png"),
+         plot = plot_obj, width = 10, height = 6, dpi = 300)
+}
+
+# Create and save all plots with meaningful names
+duration_by_age_language <- create_density_plot(
+  data = combined_df,
+  group_vars = c("age", "language"),
+  fill_color = "skyblue",
+  y_limits = y_limits,
+  plot_type = "general"
+)
+save_plot(duration_by_age_language, "duration_by_age_language")
+
+duration_by_age_language_points_only <- create_density_plot(
+  data = combined_df %>% filter(utt_type == "point_alone"),
+  group_vars = c("age", "language"),
+  fill_color = "skyblue",
+  y_limits = y_limits,
+  plot_type = "general"
+)
+save_plot(duration_by_age_language_points_only, "duration_by_age_language_points_only")
+
+# =============================================================================
+# LANGUAGE-SPECIFIC DURATION PLOTS (BY SUBJECT)
+# =============================================================================
+
+duration_homesign_by_age_child <- create_density_plot(
+  data = combined_df %>% filter(language == "Homesign"),
+  group_vars = c("age", "subject"),
+  fill_color = "coral",
+  y_limits = y_limits,
+  plot_type = "Homesign"
+)
+save_plot(duration_homesign_by_age_child, "duration_homesign_by_age_child")
+
+duration_homesign_by_age_child_points_only <- create_density_plot(
+  data = combined_df %>% filter(language == "Homesign" & utt_type == "point_alone"),
+  group_vars = c("age", "subject"),
+  fill_color = "orange",
+  y_limits = y_limits,
+  plot_type = "Homesign"
+)
+save_plot(duration_homesign_by_age_child_points_only, "duration_homesign_by_age_child_points_only")
+
+duration_asl_by_age_child <- create_density_plot(
+  data = combined_df %>% filter(language == "ASL"),
+  group_vars = c("age", "subject"),
+  fill_color = "lightgreen",
+  y_limits = y_limits,
+  plot_type = "ASL"
+)
+save_plot(duration_asl_by_age_child, "duration_asl_by_age_child")
+
+duration_asl_by_age_child_points_only <- create_density_plot(
+  data = combined_df %>% filter(language == "ASL" & utt_type == "point_alone"),
+  group_vars = c("age", "subject"),
+  fill_color = "purple",
+  y_limits = y_limits,
+  plot_type = "ASL"
+)
+save_plot(duration_asl_by_age_child_points_only, "duration_asl_by_age_child_points_only")
+
+# Print all plots
+print(duration_by_age_language)
+print(duration_by_age_language_points_only)
+print(duration_homesign_by_age_child)
+print(duration_homesign_by_age_child_points_only)
+print(duration_asl_by_age_child)
+print(duration_asl_by_age_child_points_only)
+```

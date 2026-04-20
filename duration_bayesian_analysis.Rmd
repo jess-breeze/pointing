@@ -1,0 +1,1326 @@
+---
+title: "DURATION - Bayesian Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+date: "2026-03-09"
+---
+
+<!--
+  STRUCTURE:
+    Sec 1  : Setup, packages, helper functions
+    Sec 2  : Data loading
+    Sec 3  : Data cleaning 
+    Sec 4  : Data integrity checks
+    Sec 5  : Prior specification and justification
+    Sec 6  : Bayesian duration analysis -- ALL POINTS
+    Sec 7  : Bayesian duration analysis -- ISOLATED UTTERANCES (point_alone)
+    Sec 8  : Semantic controls -- ALL POINTS         (8A full cat / 8B entity-other / 8C action-static)
+    Sec 9  : Semantic controls -- ISOLATED UTTERANCES (9A / 9B / 9C)
+    Sec 10 : Semantic controls -- POINTS NOT ALONE   (10A / 10B / 10C)
+    Sec 11 : Prior sensitivity analysis
+
+
+  BAYESIAN ASSUMPTION CHECKS (applied to every model):
+    Prior predictive check    -- do priors generate plausible duration values?
+    Posterior predictive check -- does the posterior reproduce the observed data?
+    R-hat < 1.01              -- MCMC convergence
+    Bulk ESS > 400            -- sufficient effective samples (bulk)
+    Tail ESS  > 400           -- sufficient effective samples (tails / CIs)
+    Divergent transitions = 0 -- required for valid inference
+    Pareto-k < 0.7            -- reliable LOO-CV
+    Prior sensitivity         -- conclusions stable across wider priors?
+-->
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = FALSE)
+# NOTE: cache = FALSE. Models are saved/loaded via saveRDS so re-knitting is
+# fast but we never silently use stale cached output.
+```
+
+```{r packages}
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(moments)    # skewness / kurtosis for integrity checks
+library(brms)
+library(emmeans)
+library(bayesplot)  # mcmc_trace, pp_check
+library(tidybayes)  # gather_emmeans_draws, stat_halfeye
+library(ggplot2)
+
+# Reproducibility: R-level seed (Stan seed set per-model via seed= argument)
+set.seed(42)
+options(mc.cores = parallel::detectCores())
+
+# ── Model cache ──────────────────────────────────────────────────────────────
+MODEL_DIR <- "~/Library/CloudStorage/Box-Box/Pointing project 2025/analysis/bayes_model_cache"
+dir.create(MODEL_DIR, showWarnings = TRUE, recursive = TRUE)
+stopifnot(dir.exists(MODEL_DIR))  # abort immediately if directory creation failed
+cat("Model cache directory:", MODEL_DIR, "\n")
+```
+
+```{r helper-fit-or-load}
+# fit_or_load(): fits a brms model and caches it, or loads from cache.
+# All models use seed = 42 for exact reproducibility.
+fit_or_load <- function(cache_name, formula, data, prior, family,
+                        chains = 4, iter = 4000, warmup = 2000,
+                        control = list(adapt_delta = 0.95),
+                        seed = 42) {
+  fpath <- file.path(MODEL_DIR, paste0(cache_name, ".rds"))
+  if (file.exists(fpath)) {
+    cat("  [cache] Loading:", cache_name, "\n")
+    return(readRDS(fpath))
+  }
+  cat("  [fit]   Fitting:", cache_name, "\n")
+  m <- brm(formula,
+            data    = data,
+            prior   = prior,
+            family  = family,
+            seed    = seed,
+            chains  = chains,
+            iter    = iter,
+            warmup  = warmup,
+            control = control,
+            silent  = 2)
+  saveRDS(m, fpath)
+  m
+}
+```
+
+```{r helper-diagnostics}
+# check_diagnostics(): prints R-hat, ESS, divergent transitions, and max-treedepth
+# for every fitted model. Called after every brm() fit.
+check_diagnostics <- function(model, label = "") {
+  cat("\n====", label, "====\n")
+
+  fe <- as.data.frame(summary(model)$fixed)
+  fe$param <- rownames(fe)
+  cat("Fixed effects -- R-hat and ESS:\n")
+  fe_disp <- fe[, c("param", "Rhat", "Bulk_ESS", "Tail_ESS")]
+  fe_disp[, c("Rhat", "Bulk_ESS", "Tail_ESS")] <-
+    round(fe_disp[, c("Rhat", "Bulk_ESS", "Tail_ESS")], 3)
+  print(fe_disp)
+
+  bad_rhat <- fe$param[!is.na(fe$Rhat) & fe$Rhat >= 1.01]
+  low_bulk <- fe$param[!is.na(fe$Bulk_ESS) & fe$Bulk_ESS < 400]
+  low_tail <- fe$param[!is.na(fe$Tail_ESS) & fe$Tail_ESS < 400]
+
+  if (length(bad_rhat) == 0)
+    cat("PASS R-hat  : all < 1.01 -- chains converged\n")
+  else
+    cat("FAIL R-hat  : >=1.01 for:", paste(bad_rhat, collapse = ", "),
+        "-- increase iter=\n")
+
+  if (length(low_bulk) == 0)
+    cat("PASS BulkESS: all > 400\n")
+  else
+    cat("FAIL BulkESS: <400 for:",  paste(low_bulk, collapse = ", "), "\n")
+
+  if (length(low_tail) == 0)
+    cat("PASS TailESS: all > 400\n")
+  else
+    cat("FAIL TailESS: <400 for:",  paste(low_tail, collapse = ", "), "\n")
+
+  # Divergent transitions -- must be zero for valid posterior inference
+  np    <- nuts_params(model)
+  n_div <- sum(subset(np, Parameter == "divergent__")$Value)
+  if (n_div == 0)
+    cat("PASS Divergences: 0\n")
+  else
+    cat("FAIL Divergences:", n_div,
+        "-- increase adapt_delta or reparameterise model\n")
+
+  # Max tree-depth (informational, not a hard failure)
+  n_tree <- sum(subset(np, Parameter == "treedepth__")$Value >= 10)
+  if (n_tree > 0)
+    cat("NOTE: max treedepth exceeded", n_tree, "transitions\n")
+
+  invisible(NULL)
+}
+```
+
+```{r helper-results}
+# ── Posterior summary helpers ────────────────────────────────────────────────
+
+# summarise_group_means():
+#   Returns back-transformed geometric means (seconds) with 89% CrI and
+#   P(mean > 0 on log scale) -- not usually reported for means, but included
+#   for completeness.
+#   For Gaussian(log_duration): emmeans gives log-scale means; exp() back-transforms.
+summarise_group_means <- function(model, group_var = "language_group",
+                                  log_response = TRUE) {
+  em   <- emmeans(model, as.formula(paste("~", group_var)))
+  drws <- gather_emmeans_draws(em)  # one row per draw per group level
+
+  drws %>%
+    group_by(.data[[group_var]]) %>%
+    summarise(
+      posterior_mean_sec = if (log_response) round(mean(exp(.value)), 3)
+                           else round(mean(.value), 3),
+      lower_89ci = if (log_response) round(exp(quantile(.value, 0.055)), 3)
+                   else round(quantile(.value, 0.055), 3),
+      upper_89ci = if (log_response) round(exp(quantile(.value, 0.945)), 3)
+                   else round(quantile(.value, 0.945), 3),
+      .groups = "drop"
+    )
+}
+
+# summarise_contrasts():
+#   Pairwise contrasts on the log scale with posterior mean, 89% CrI, and
+#   P(beta > 0 | data). Positive = first group has longer duration.
+summarise_contrasts <- function(model, group_var = "language_group") {
+  em      <- emmeans(model, as.formula(paste("~", group_var)))
+  c_em    <- contrast(em, method = "pairwise", adjust = "none")
+  c_draws <- gather_emmeans_draws(c_em)
+
+  c_draws %>%
+    group_by(contrast) %>%
+    summarise(
+      posterior_mean = round(mean(.value), 3),
+      lower_89ci     = round(quantile(.value, 0.055), 3),
+      upper_89ci     = round(quantile(.value, 0.945), 3),
+      prob_positive  = round(mean(.value > 0), 3),
+      .groups = "drop"
+    )
+}
+
+# posterior_plot():
+#   Visualises pairwise contrasts as posterior half-eye plots. Vertical dashed line at 0 = no difference.
+posterior_plot <- function(model, group_var = "language_group",
+                           title = "", fill_col = "steelblue") {
+  em      <- emmeans(model, as.formula(paste("~", group_var)))
+  c_em    <- contrast(em, method = "pairwise", adjust = "none")
+  c_draws <- gather_emmeans_draws(c_em)
+
+  ggplot(c_draws, aes(x = .value, y = contrast)) +
+    stat_halfeye(.width = 0.89, point_interval = mean_qi,
+                 fill = fill_col, alpha = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed",
+               colour = "red", linewidth = 0.8) +
+    labs(title    = title,
+         subtitle = "Dots = posterior means; bars = 89% credible intervals",
+         x        = "Difference in log(Duration) (row - column)",
+         y        = NULL) +
+    theme_minimal(base_size = 12)
+}
+
+# check_loo_pareto():
+#   Reports Pareto-k diagnostics for LOO-CV. k > 0.7 means LOO is unreliable
+#   for those observations (moment-matching or reloo() needed).
+check_loo_pareto <- function(model, label = "") {
+  model   <- add_criterion(model, "loo")
+  k_vals  <- model$criteria$loo$diagnostics$pareto_k
+  n_good  <- sum(k_vals <= 0.5)
+  n_ok    <- sum(k_vals > 0.5 & k_vals <= 0.7)
+  n_bad   <- sum(k_vals > 0.7)
+  cat(label, "-- Pareto-k: good (<=0.5):", n_good,
+      "| ok (0.5-0.7):", n_ok, "| bad (>0.7):", n_bad, "\n")
+  if (n_bad > 0)
+    cat("  NOTE: refit with moment_match = TRUE for the", n_bad,
+        "flagged obs, or use reloo()\n")
+  invisible(model)
+}
+```
+
+# Data Loading
+
+```{r load-data}
+hearing_all     <- read.csv("~/Library/CloudStorage/Box-Box/Pointing project 2025/datasets/hearing_datasets/all_hearing_August_2025_final.csv")
+homesign_points <- read.csv("~/Library/CloudStorage/Box-Box/Pointing project 2025/datasets/homesign_points2.csv",
+                             stringsAsFactors = FALSE)
+deaf_points     <- read.csv("~/Library/CloudStorage/Box-Box/Pointing project 2025/datasets/deaf_datasets/PointCodingExportFINAL_022426.csv",
+                            stringsAsFactors = FALSE)
+```
+
+# Data Cleaning
+
+```{r helper-functions}
+convert_age <- function(age_months) {
+  case_when(
+    age_months == 18 ~ "1;06", age_months == 22 ~ "1;10",
+    age_months == 26 ~ "2;02", age_months == 30 ~ "2;06",
+    age_months == 34 ~ "2;10", TRUE ~ as.character(age_months))
+}
+
+standardize_age_bins <- function(age) {
+  case_when(
+    age == "2;05" ~ "2;02", age == "3;00" ~ "2;10",
+    age == "3;03" ~ "3;02", age == "3;05" ~ "3;02",
+    age == "3;09" ~ "3;06", age == "3;11" ~ "3;10",
+    age == "4;00" ~ "3;10", age == "4;03" ~ "4;02",
+    TRUE ~ age)
+}
+
+convert_age_to_numeric <- function(age_string) {
+  case_when(
+    age_string == "1;06" ~ 18, age_string == "1;10" ~ 22,
+    age_string == "2;02" ~ 26, age_string == "2;06" ~ 30,
+    age_string == "2;10" ~ 34, age_string == "3;02" ~ 38,
+    age_string == "3;10" ~ 46, TRUE ~ NA_real_)
+}
+
+create_language_group <- function(language, modality) {
+  case_when(
+    language == "English" & modality == "Points"   ~ "English-Points",
+    language == "English" & modality == "Pronouns" ~ "English-Pronouns",
+    language == "ASL"      ~ "ASL",
+    language == "Homesign" ~ "Homesign",
+    TRUE ~ NA_character_)
+}
+```
+
+```{r clean-data}
+# ── Hearing ──
+hearing_all <- hearing_all %>%
+  mutate(
+    age = convert_age(as.numeric(as.character(as.factor(age)))),
+    simple_utt_type = case_when(
+      modality == "Pronouns" ~ NA_character_,
+      utt_type == "point_alone" ~ "point alone",
+      utt_type %in% c("point+singleword", "point+singleword_pron",
+                      "point_in_multiword_utt", "point+pronoun_in_multiword_utt",
+                      "point+pronoun_only") ~ "point alongside speech",
+      TRUE ~ NA_character_),
+    simple_redundancy = case_when(
+      modality == "Pronouns" ~ NA_character_,
+      pt_redundancy == "Point Alone"     ~ "Point Alone",
+      pt_redundancy == "Not Redundant"   ~ "Not Redundant",
+      pt_redundancy %in% c("Redundant with Pronoun",
+                           "Redundant with Other PoS") ~ "Redundant",
+      TRUE ~ NA_character_),
+    number_of_words = str_count(c_utts, "\\S+"),
+    number_of_words = if_else(number_of_words >= 5, "5+",
+                              as.character(number_of_words))
+  ) %>%
+  relocate(number_of_words, .after = c_utts) %>%
+  filter(!grepl("exclude", comments, ignore.case = TRUE))
+
+# ── Deaf (ASL) ──
+deaf_points <- deaf_points %>%
+  mutate(
+    duration_sec      = as.numeric(duration_sec),
+    age               = if_else(age %in% c("1;07", "1;06"), "1;06", age),
+    semantic_category = if_else(semantic_category == "entity.location",
+                                "entity", semantic_category),
+    number_of_signs   = if_else(is.na(number_of_signs), 1, number_of_signs),
+    number_of_signs   = if_else(number_of_signs >= 5, "5+",
+                                as.character(number_of_signs))
+  ) %>%
+  filter(!is.na(duration_sec))
+
+# ── Homesign ──
+homesign_points <- homesign_points %>%
+  mutate(
+    Utterance_type  = if_else(Utterance_type == "Alone ", "Alone", Utterance_type),
+    Number.of.signs = if_else(Number.of.signs >= 5, "5+",
+                              as.character(Number.of.signs)),
+    age             = standardize_age_bins(Age),
+    age_precise     = Age
+  ) %>%
+  filter(Subject != "")
+
+# ── Combine ──
+deaf_clean <- deaf_points %>%
+  mutate(modality = "Points", language = "ASL",
+         subject  = as.character(subject)) %>%
+  rename(semantic_cat = semantic_category, utt_type = utterance_type) %>%
+  select(subject, age, utt_type, modality, duration_sec, semantic_cat, language)
+
+hearing_clean <- hearing_all %>%
+  mutate(language = "English", subject = as.character(subject)) %>%
+  select(subject, age, utt_type, modality, duration_sec, semantic_cat, language)
+
+homesign_clean <- homesign_points %>%
+  mutate(language = "Homesign", modality = "Points") %>%
+  rename(duration_sec = `Duration...ss.msec`, utt_type = Utterance_type) %>%
+  select(subject = Subject, age, utt_type, modality,
+         duration_sec, language, semantic_cat)
+
+combined_df <- bind_rows(hearing_clean, deaf_clean, homesign_clean) %>%
+  mutate(
+    age = if_else(
+      grepl("^\\d+$", age),
+      paste(floor(as.numeric(age) / 12),
+            sprintf("%02d", as.numeric(age) %% 12), sep = ";"),
+      age),
+    utt_type = case_when(
+      utt_type == "point" ~ "point_alone",
+      utt_type == "Alone" ~ "point_alone",
+      TRUE ~ utt_type)
+  )
+
+# ── Analysis-ready base dataset ──
+stats_data <- combined_df %>%
+  filter(!is.na(language)) %>%
+  mutate(
+    language_group = create_language_group(language, modality),
+    age_numeric    = convert_age_to_numeric(age),
+    language_group = factor(language_group,
+                            levels = c("English-Points", "ASL", "Homesign")),
+    subject        = factor(subject),
+    log_duration   = ifelse(!is.na(duration_sec), log(duration_sec), NA)
+  )
+
+duration_data <- stats_data %>%
+  filter(modality == "Points",  # restrict to pointing events only (excludes English-Pronouns)
+         !is.na(language_group), !is.na(duration_sec), is.finite(log_duration)) %>%
+  mutate(language_group = droplevels(language_group))
+```
+
+# Data Integrity Checks
+
+```{r data-integrity}
+cat("=== DATA INTEGRITY CHECKS ===\n\n")
+
+# 1. Non-positive durations (log(0) = -Inf; log(<0) = NaN; breaks models)
+n_zero_neg <- sum(duration_data$duration_sec <= 0, na.rm = TRUE)
+cat("Non-positive duration_sec:", n_zero_neg,
+    ifelse(n_zero_neg == 0, " -- OK\n", " -- WARNING: will break log-transform\n"))
+
+# 2. Non-finite log_duration
+n_bad <- sum(!is.finite(duration_data$log_duration), na.rm = TRUE)
+cat("Non-finite log_duration  :", n_bad,
+    ifelse(n_bad == 0, " -- OK\n\n", " -- WARNING: remove before fitting\n\n"))
+
+# 3. Sample sizes
+cat("Sample sizes (all points):\n")
+duration_data %>%
+  group_by(language_group) %>%
+  summarise(n_obs = n(), n_subjects = n_distinct(subject),
+            n_age_levels = n_distinct(age_numeric),
+            mean_dur_sec = round(mean(duration_sec), 2),
+            sd_dur_sec   = round(sd(duration_sec), 2),
+            .groups = "drop") %>%
+  print()
+
+# 4. Skewness -- justifies log-transform / Gamma GLMM
+sk_raw <- skewness(duration_data$duration_sec, na.rm = TRUE)
+sk_log <- skewness(duration_data$log_duration,  na.rm = TRUE)
+cat("\nSkewness (raw duration_sec):", round(sk_raw, 2),
+    "-- right-skewed distributions justify log-transform or Gamma family\n")
+cat("Skewness (log_duration)    :", round(sk_log, 2),
+    "-- values near 0 indicate log-transform stabilises the distribution\n\n")
+
+# 5. Semantic category coverage (relevant for Sections 8-10)
+cat("Semantic category coverage (points only, excluding English-Pronouns):\n")
+duration_data %>%
+  filter(language_group != "English-Pronouns", !is.na(semantic_cat)) %>%
+  count(language_group, semantic_cat) %>%
+  pivot_wider(names_from = language_group, values_from = n, values_fill = 0) %>%
+  print()
+```
+
+# Prior Specification and Justification
+
+```{r priors}
+cat("=== PRIOR SPECIFICATION ===\n\n")
+cat("Response variable: log(duration_sec), modelled with Gaussian family.\n")
+cat("  Typical pointing durations: 0.3 - 3 seconds\n")
+cat("  On log scale: log(0.3) =", round(log(0.3), 2),
+    "  log(1) = 0  log(3) =", round(log(3), 2), "\n\n")
+
+cat("PRIORS CHOSEN (weakly informative):\n")
+cat("  Intercept ~ Normal(0, 1)\n")
+cat("    95% prior mass on exp(-2) = 0.14 s  to  exp(2) = 7.4 s\n")
+cat("    Deliberately wider than expected data range; data will dominate.\n\n")
+cat("  Fixed effects (b) ~ Normal(0, 0.5)\n")
+cat("    95% prior mass on differences of exp(-1) = 0.37x to exp(1) = 2.7x\n")
+cat("    Allows realistic between-group differences without favouring large effects.\n\n")
+cat("  Random effect SDs ~ Exponential(1)\n")
+cat("    Positive by construction; expected value = 1 on log scale.\n\n")
+cat("  Residual SD (sigma) ~ Exponential(1)  -- same reasoning.\n\n")
+cat("SENSITIVITY: Section 11 refits the main model with wider priors,\n")
+cat("Normal(0, 1) for fixed effects, to confirm conclusions are prior-robust.\n")
+
+# Standard priors (log-LMM -- used throughout Sections 6-10)
+std_priors <- c(
+  prior(normal(0, 1),   class = Intercept),
+  prior(normal(0, 0.5), class = b),
+  prior(exponential(1), class = sd),
+  prior(exponential(1), class = sigma)
+)
+
+# Gamma GLMM priors (Section 6 alternative model)
+gamma_priors <- c(
+  prior(normal(0, 1),   class = Intercept),
+  prior(normal(0, 0.5), class = b),
+  prior(exponential(1), class = sd),
+  prior(exponential(1), class = shape)
+)
+
+# Wider priors for sensitivity analysis (Section 11)
+wide_priors <- c(
+  prior(normal(0, 2),    class = Intercept),
+  prior(normal(0, 1),    class = b),
+  prior(exponential(0.5),class = sd),
+  prior(exponential(0.5),class = sigma)
+)
+```
+
+# Bayesian Duration Analysis -- ALL POINTS
+
+## Prior Predictive Check
+
+```{r ppc-allpts}
+cat("PRIOR PREDICTIVE CHECK -- ALL POINTS\n")
+cat("Confirms priors generate plausible duration values before seeing data.\n\n")
+
+ppc_m <- brm(
+  log_duration ~ language_group + (1 | subject) + (1 | age_numeric),
+  data         = duration_data,
+  prior        = std_priors,
+  family       = gaussian(),
+  sample_prior = "only",
+  chains = 2, iter = 1000, warmup = 500,
+  seed = 42, silent = 2
+)
+
+pp_s   <- exp(posterior_predict(ppc_m, ndraws = 500))  # back to seconds
+obs_s  <- duration_data$duration_sec
+
+cat("Prior predictive (seconds) -- 5th / 50th / 95th percentile:\n  ",
+    round(quantile(pp_s, 0.05), 2), "/",
+    round(median(pp_s), 2), "/",
+    round(quantile(pp_s, 0.95), 2), "\n")
+cat("Observed (seconds)         -- 5th / 50th / 95th percentile:\n  ",
+    round(quantile(obs_s, 0.05, na.rm = TRUE), 2), "/",
+    round(median(obs_s, na.rm = TRUE), 2), "/",
+    round(quantile(obs_s, 0.95, na.rm = TRUE), 2), "\n\n")
+cat("PASS criterion: prior range wider than observed; no mass on impossible\n")
+cat("values (e.g., > 1000 s or < 0.001 s).\n\n")
+
+pp_check(ppc_m, ndraws = 100, type = "dens_overlay") +
+  labs(title    = "Prior Predictive Check -- All Points (log scale)",
+       subtitle = "Lines = prior predictive draws; dark line = observed log(duration)",
+       x = "log(Duration)") +
+  theme_minimal()
+```
+
+## Fit Models
+
+```{r fit-allpts}
+# NULL model (no language_group) -- for LOO comparison
+bayes_dur_null <- fit_or_load(
+  "dur_all_null",
+  log_duration ~ 1 + (1 | subject) + (1 | age_numeric),
+  data   = duration_data,
+  prior  = c(prior(normal(0, 1),   class = Intercept),
+             prior(exponential(1), class = sd),
+             prior(exponential(1), class = sigma)),
+  family = gaussian()
+)
+
+# FULL log-LMM 
+bayes_dur_full <- fit_or_load(
+  "dur_all_full",
+  log_duration ~ language_group + (1 | subject) + (1 | age_numeric),
+  data   = duration_data,
+  prior  = std_priors,
+  family = gaussian()
+)
+
+# Gamma GLMM alternative 
+bayes_dur_gamma <- fit_or_load(
+  "dur_all_gamma",
+  duration_sec ~ language_group + (1 | subject) + (1 | age_numeric),
+  data   = duration_data,
+  prior  = gamma_priors,
+  family = Gamma(link = "log")
+)
+```
+
+## MCMC Diagnostics
+
+```{r diag-allpts}
+check_diagnostics(bayes_dur_full,  "Log-LMM -- All Points")
+check_diagnostics(bayes_dur_gamma, "Gamma GLMM -- All Points")
+```
+
+```{r trace-allpts}
+# Trace plots: good mixing = overlapping 'fuzzy caterpillar' chains
+lang_pars_full <- grep("^b_language_group",
+                        variables(bayes_dur_full), value = TRUE)
+mcmc_trace(bayes_dur_full,
+           pars = c("b_Intercept", lang_pars_full),
+           facet_args = list(ncol = 2)) +
+  labs(title    = "Trace Plots: Log-LMM All Points",
+       subtitle = "Chains should overlap with no trends or sticking points") +
+  theme_minimal()
+```
+
+## Posterior Predictive Check
+
+```{r ppc-post-allpts}
+pp_check(bayes_dur_full, ndraws = 100, type = "dens_overlay") +
+  labs(title    = "Posterior Predictive Check: Log-LMM -- All Points (log scale)",
+       subtitle = "Blue lines = model predictions; dark line = observed data",
+       x = "log(Duration)") +
+  theme_minimal()
+
+pp_check(bayes_dur_gamma, ndraws = 100, type = "dens_overlay") +
+  labs(title    = "Posterior Predictive Check: Gamma GLMM -- All Points",
+       subtitle = "Blue lines = model predictions; dark line = observed data",
+       x = "Duration (seconds)") +
+  theme_minimal()
+cat("PASS criterion: predicted density (blue) should closely envelope observed (dark).\n")
+```
+
+## Results
+
+```{r results-allpts}
+cat("=== RESULTS: LOG-LMM -- ALL POINTS ===\n\n")
+
+cat("FIXED EFFECTS (log scale, 95% CrI from summary):\n")
+print(round(fixef(bayes_dur_full)[, c("Estimate","Est.Error","Q2.5","Q97.5")], 3))
+
+cat("\nBACK-TRANSFORMED MARGINAL MEANS (geometric mean seconds, 89% CrI):\n")
+cat("(Marginalises over subject and age random effects via emmeans)\n")
+print(summarise_group_means(bayes_dur_full))
+
+cat("\nBAYES R-SQUARED (proportion of variance in log_duration explained):\n")
+print(round(bayes_R2(bayes_dur_full), 3))
+
+cat("\nPAIRWISE CONTRASTS -- log scale, 89% CrI, P(beta > 0 | data):\n")
+cat("Positive contrast = first-listed group has longer duration.\n")
+cat("P(beta > 0 | data) > 0.95 or < 0.05 = strong directional evidence\n")
+cat("P(beta > 0 | data) ~ 0.90-0.95       = moderate evidence \n")
+cat("P(beta > 0 | data) ~ 0.50            = no directional evidence\n\n")
+print(summarise_contrasts(bayes_dur_full))
+```
+
+```{r posterior-plot-allpts}
+posterior_plot(bayes_dur_full,
+               title    = "Posterior Distributions: Duration Differences -- All Points",
+               fill_col = "steelblue")
+```
+
+```{r loo-allpts}
+cat("MODEL COMPARISON: NULL vs FULL (LOO-CV)\n")
+cat("LOO INTERPRETATION NOTE:\n")
+cat("LOO-CV tests out-of-sample predictive accuracy. A non-decisive ELPD\n")
+cat("difference (|diff| < 2*SE) means language group does not strongly improve\n")
+cat("PREDICTION of individual observations -- not that group differences are\n")
+cat("absent. Posterior contrasts (P(beta > 0 | data)) answer the question of\n")
+cat("whether group differences exist and in which direction; LOO answers whether\n")
+cat("those differences are large enough to meaningfully improve single-obs\n")
+cat("predictions. Both are reported; neither supersedes the other.\n\n")
+
+bayes_dur_null  <- check_loo_pareto(bayes_dur_null,  "Log-LMM null")
+bayes_dur_full  <- check_loo_pareto(bayes_dur_full,  "Log-LMM full")
+bayes_dur_gamma <- check_loo_pareto(bayes_dur_gamma, "Gamma GLMM full")
+
+cat("\nNull vs Full log-LMM:\n")
+print(loo_compare(bayes_dur_null, bayes_dur_full))
+
+# NOTE: Direct LOO comparison between the log-LMM and Gamma GLMM is not valid
+# because the two models use different response variables (log_duration vs
+# duration_sec). loo_compare() requires identical outcome variables to produce
+# comparable ELPD values. The log-LMM is retained as the primary model on the
+# following grounds:
+# (1) Log-transformation produces an approximately symmetric response
+#     (skewness = -0.77 post-transform vs 3.49 raw), satisfying the Gaussian
+#     likelihood assumption.
+# (2) Results on the log scale are directly interpretable as log-ratio
+#     differences (i.e. multiplicative effects on duration in seconds).
+# (3) Consistency: a single model family across all 14 sub-analyses aids
+#     comparability of effect sizes and credible intervals.
+# (4) Posterior predictive checks confirmed adequate fit for the log-LMM.
+
+cat("NOTE: Gamma GLMM vs log-LMM LOO comparison omitted -- models have\n")
+cat("different response variables and their ELPDs are not on a comparable\n")
+cat("scale. Log-LMM retained as primary model; see code comment for rationale.\n\n")
+```
+
+```{r loo-gamma-corrected}
+# DISTRIBUTIONAL ASSUMPTION CHECK: Log-Normal vs Gamma (Jacobian-corrected LOO)
+# ─────────────────────────────────────────────────────────────────────────────
+# A direct loo_compare() across different response variables is invalid. To make
+# the ELPDs comparable we apply a Jacobian correction to the log-LMM:
+#
+#   log p(y_i | theta) = log p(log y_i | theta)  -  log(y_i)
+#
+# This converts the log-scale density to the original-seconds scale, so both
+# models are evaluated in units of log p(duration_sec). loo_compare() is then valid.
+#
+# Reference: Vehtari et al. (2017) "Practical Bayesian model evaluation using
+# leave-one-out cross-validation and WAIC", Statistics and Computing.
+
+cat("=== DISTRIBUTIONAL CHECK: LOG-NORMAL vs GAMMA (Jacobian-corrected LOO) ===\n\n")
+cat("Pointing durations may have heavy tails better captured by a Gamma than a\n")
+cat("log-normal. Direct loo_compare() is invalid across different response scales,\n")
+cat("so we apply a Jacobian correction to align the log-LMM ELPDs to the\n")
+cat("original-seconds scale before comparing.\n\n")
+
+# Extract pointwise log-likelihoods (S draws x N observations)
+ll_lognorm <- log_lik(bayes_dur_full)   # log p(log y_i | theta)
+ll_gamma   <- log_lik(bayes_dur_gamma)  # log p(y_i | theta) -- already on seconds scale
+
+# Jacobian correction: log p(y_i) = log p(log y_i) - log(y_i)
+log_y_vec            <- log(duration_data$duration_sec)
+ll_lognorm_corrected <- sweep(ll_lognorm, 2, log_y_vec, FUN = "-")
+
+# Compute LOO from corrected matrices
+loo_lognorm_corrected <- loo(ll_lognorm_corrected)
+loo_gamma_direct      <- loo(ll_gamma)
+
+cat("LOO -- Jacobian-corrected log-normal (seconds scale):\n")
+print(loo_lognorm_corrected)
+cat("\nLOO -- Gamma GLMM (seconds scale):\n")
+print(loo_gamma_direct)
+
+cat("\nModel comparison (both on the same response scale -- valid loo_compare):\n")
+print(loo_compare(loo_lognorm_corrected, loo_gamma_direct))
+
+cat("\nINTERPRETATION:\n")
+cat("  |ELPD diff| < 2 * SE  => models statistically equivalent for prediction.\n")
+cat("  Gamma ELPD > log-normal ELPD => Gamma handles heavy-tailed durations better.\n")
+cat("  The log-LMM remains the primary model for consistency across all 14 sub-analyses,\n")
+cat("  but a decisive Gamma preference adds distributional rigour and confirms that\n")
+cat("  long-tail durations do not unduly influence the log-normal estimates.\n")
+```
+
+# Bayesian Focused Analysis -- Isolated Utterances (point_alone)
+
+```{r focused-data-prep}
+focused_duration_data <- combined_df %>%
+  filter(utt_type == "point_alone", !is.na(language)) %>%
+  mutate(
+    language_group = create_language_group(language, modality),
+    age_numeric    = convert_age_to_numeric(age),
+    subject        = factor(subject),
+    log_duration   = ifelse(!is.na(duration_sec), log(duration_sec), NA)
+  ) %>%
+  filter(!is.na(duration_sec), is.finite(log_duration)) %>%
+  mutate(
+    # Drop any empty factor levels. English-Pronouns are already excluded
+    # upstream (modality == "Points" filter). droplevels() is kept as a safety net.
+    language_group = factor(language_group,
+                            levels = c("English-Points", "ASL", "Homesign")),
+    language_group = droplevels(language_group)
+  )
+
+cat("Focused (point_alone) sample sizes:\n")
+focused_duration_data %>%
+  group_by(language_group) %>%
+  summarise(n_obs = n(), n_subjects = n_distinct(subject), .groups = "drop") %>%
+  print()
+
+# VERIFY Item 5: Per-subject isolated-point percentages
+# Denominator = all pointing gestures in duration_data (the same sessions used in analysis).
+cat("\nVERIFY Item 5 -- Isolated-point % per subject (mean and SD by group):\n")
+duration_data %>%
+  group_by(language_group, subject) %>%
+  summarise(
+    n_total = n(),
+    n_alone = sum(utt_type == "point_alone", na.rm = TRUE),
+    pct_alone = 100 * n_alone / n_total,
+    .groups = "drop"
+  ) %>%
+  group_by(language_group) %>%
+  summarise(
+    mean_pct = round(mean(pct_alone), 1),
+    sd_pct   = round(sd(pct_alone), 1),
+    n_subjects = n(),
+    .groups = "drop"
+  ) %>%
+  print()
+
+cat("\nLevels present (English-Pronouns excluded if no point_alone data):\n")
+print(levels(focused_duration_data$language_group))
+```
+
+```{r fit-focused}
+# Focused models: no age_numeric random effect 
+foc_null_prior <- c(prior(normal(0, 1),   class = Intercept),
+                    prior(exponential(1), class = sd),
+                    prior(exponential(1), class = sigma))
+
+bayes_foc_null <- fit_or_load(
+  "foc_null",
+  log_duration ~ 1 + (1 | subject),
+  data   = focused_duration_data,
+  prior  = foc_null_prior,
+  family = gaussian()
+)
+
+bayes_foc_full <- fit_or_load(
+  "foc_full",
+  log_duration ~ language_group + (1 | subject),
+  data   = focused_duration_data,
+  prior  = std_priors,
+  family = gaussian()
+)
+```
+
+```{r diag-focused}
+check_diagnostics(bayes_foc_full, "Log-LMM -- Focused (point_alone)")
+
+mcmc_trace(bayes_foc_full,
+           pars = c("b_Intercept",
+                    grep("^b_language_group",
+                         variables(bayes_foc_full), value = TRUE)),
+           facet_args = list(ncol = 2)) +
+  labs(title = "Trace Plots: Log-LMM Focused") +
+  theme_minimal()
+
+pp_check(bayes_foc_full, ndraws = 100, type = "dens_overlay") +
+  labs(title = "Posterior Predictive Check: Log-LMM Focused",
+       x = "log(Duration)") +
+  theme_minimal()
+```
+
+```{r results-focused}
+cat("=== RESULTS: LOG-LMM -- FOCUSED (point_alone) ===\n\n")
+
+cat("FIXED EFFECTS (log scale, 95% CrI):\n")
+print(round(fixef(bayes_foc_full)[, c("Estimate","Est.Error","Q2.5","Q97.5")], 3))
+
+cat("\nBACK-TRANSFORMED MARGINAL MEANS (seconds, 89% CrI):\n")
+print(summarise_group_means(bayes_foc_full))
+
+cat("\nBAYES R-SQUARED:\n")
+print(round(bayes_R2(bayes_foc_full), 3))
+
+cat("\nPAIRWISE CONTRASTS (log scale, 89% CrI, P(beta > 0 | data)):\n")
+print(summarise_contrasts(bayes_foc_full))
+
+cat("\nLOO MODEL COMPARISON:\n")
+bayes_foc_null <- check_loo_pareto(bayes_foc_null, "Focused null")
+bayes_foc_full <- check_loo_pareto(bayes_foc_full, "Focused full")
+print(loo_compare(bayes_foc_null, bayes_foc_full))
+
+# VERIFY Item 4: Figure 3 arithmetic means and SDs (isolated / point-alone data)
+cat("\nVERIFY Item 4 -- Figure 3 arithmetic means (for figure caption):\n")
+focused_duration_data %>%
+  group_by(language_group) %>%
+  summarise(
+    mean_sec = round(mean(duration_sec), 2),
+    sd_sec   = round(sd(duration_sec), 2),
+    n_obs    = n(),
+    .groups  = "drop"
+  ) %>%
+  print()
+```
+
+```{r posterior-plot-focused}
+posterior_plot(bayes_foc_full,
+               title    = "Posterior Distributions: Duration Differences -- Isolated Utterances",
+               fill_col = "coral")
+```
+
+```{r rope-isolated, message=FALSE, warning=FALSE}
+# ROPE Analysis: Region of Practical Equivalence for ASL vs Homesign (isolated points)
+# --------------------------------------------------------------------------------------
+# The ASL-Homesign isolated contrast has a wide credible interval straddling zero
+# (posterior mean ~ -0.07 log-s, 89% CrI ~ [-0.39, 0.26], P(beta>0) = 0.346).
+# ROPE quantifies *how much* of the posterior lies within a region we would consider
+# practically negligible, complementing the directional probability.
+#
+# ROPE bounds (log-scale):
+#   Narrow  ±0.10 log-units  ≈ ±10.5% multiplicative difference in seconds
+#           (roughly 1 ELAN annotation-frame at typical durations ~0.5 s)
+#   Broader ±0.20 log-units  ≈ ±22% multiplicative difference
+#           (conservative "small effect" threshold on log scale)
+
+library(bayestestR)
+
+# Extract posterior draws for the ASL-Homesign contrast from the isolated model
+foc_draws <- bayes_foc_full %>%
+  emmeans(~ language_group) %>%
+  gather_emmeans_draws() %>%
+  pivot_wider(names_from = language_group, values_from = .value) %>%
+  mutate(ASL_minus_Hom = ASL - Homesign)
+
+asl_hom_posterior <- foc_draws$ASL_minus_Hom
+
+# ROPE calculations
+rope_narrow  <- rope(asl_hom_posterior, range = c(-0.10,  0.10), ci = 0.89)
+rope_broader <- rope(asl_hom_posterior, range = c(-0.20,  0.20), ci = 0.89)
+
+cat("=== ROPE ANALYSIS: ASL vs Homesign (isolated points) ===
+
+")
+cat("Posterior mean (log-s):  ", round(mean(asl_hom_posterior), 3), "
+")
+cat("89% CrI:                 [",
+    round(quantile(asl_hom_posterior, 0.055), 3), ", ",
+    round(quantile(asl_hom_posterior, 0.945), 3), "]
+
+", sep="")
+
+cat("ROPE ±0.10 log-units (~10.5% multiplicative difference):
+")
+print(rope_narrow)
+
+cat("
+ROPE ±0.20 log-units (~22% multiplicative difference):
+")
+print(rope_broader)
+
+cat("
+INTERPRETATION:
+")
+cat("  % of 89% posterior inside ROPE (±0.10): ",
+    round(rope_narrow$ROPE_Percentage * 100, 1), "%
+", sep="")
+cat("  % of 89% posterior inside ROPE (±0.20): ",
+    round(rope_broader$ROPE_Percentage * 100, 1), "%
+", sep="")
+cat("
+  A high ROPE% (>95%) would support practical equivalence.
+")
+cat("  A low ROPE% (<5%) with narrow CrI would support a meaningful difference.
+")
+cat("  Intermediate values (as expected here) reflect genuine uncertainty —
+")
+cat("  the data are consistent with both negligible and moderate differences.
+")
+```
+
+# Semantic Controls -- ALL POINTS (8A / 8B / 8C)
+
+```{r sem-all-data-prep}
+# "unclear" semantic category excluded: observations where the referent could
+# not be classified provide no valid semantic control information and would
+# conflate the control variable with missing data.
+sem_duration_data <- duration_data %>%
+  filter(language_group != "English-Pronouns", !is.na(semantic_cat)) %>%
+  filter(semantic_cat != "unclear") %>%
+  mutate(
+    language_group   = droplevels(factor(language_group,
+                                          levels = c("English-Points","ASL","Homesign"))),
+    semantic_cat     = factor(semantic_cat),
+    entity_vs_other  = factor(case_when(
+      semantic_cat == "entity" ~ "entity",
+      semantic_cat %in% c("actor","instrument","patient","recipient","source",
+                          "location","picture","place","possessor") ~ "other",
+      TRUE ~ NA_character_)),
+    action_vs_static = factor(case_when(
+      semantic_cat %in% c("actor","instrument","patient","recipient","source") ~ "ACTION",
+      semantic_cat %in% c("entity","location","picture","place","possessor")   ~ "STATIC",
+      TRUE ~ NA_character_))
+  )
+
+sem_entoth <- sem_duration_data %>% filter(!is.na(entity_vs_other))
+sem_acstat <- sem_duration_data %>% filter(!is.na(action_vs_static))
+
+cat("Semantic-control data (all points, no English-Pronouns, unclear excluded):\n")
+sem_duration_data %>%
+  group_by(language_group) %>%
+  summarise(n_obs = n(), n_subjects = n_distinct(subject), .groups = "drop") %>%
+  print()
+```
+
+```{r helper-sem-analysis}
+# run_sem_analysis():
+# Fits null and full Bayesian log-LMMs for one semantic covariate.
+# Runs full diagnostics, LOO comparison, marginal means, pairwise contrasts,
+# and posterior plot. 
+run_sem_analysis <- function(data, covariate, section_label,
+                              null_cache, full_cache,
+                              has_age_re = TRUE,
+                              fill_col   = "steelblue") {
+
+  re_str  <- if (has_age_re) "(1 | subject) + (1 | age_numeric)" else "(1 | subject)"
+  null_f  <- as.formula(paste("log_duration ~", covariate, "+", re_str))
+  full_f  <- as.formula(paste("log_duration ~ language_group +",
+                               covariate, "+", re_str))
+
+  cat("\n", paste(rep("=", 60), collapse=""), "\n")
+  cat(section_label, "\n")
+  cat(paste(rep("=", 60), collapse=""), "\n\n")
+
+  m_null <- fit_or_load(null_cache, null_f, data = data,
+                         prior  = std_priors, family = gaussian())
+  m_full <- fit_or_load(full_cache, full_f, data = data,
+                         prior  = std_priors, family = gaussian())
+
+  # Diagnostics
+  check_diagnostics(m_full, paste(section_label, "-- full model"))
+
+  print(
+    mcmc_trace(m_full,
+               pars = c("b_Intercept",
+                        grep("^b_language_group",
+                             variables(m_full), value = TRUE)),
+               facet_args = list(ncol = 2)) +
+      labs(title = paste("Trace Plots:", section_label)) +
+      theme_minimal()
+  )
+
+  print(
+    pp_check(m_full, ndraws = 100, type = "dens_overlay") +
+      labs(title = paste("PPC:", section_label), x = "log(Duration)") +
+      theme_minimal()
+  )
+
+  # LOO comparison: does language_group improve fit beyond the semantic covariate?
+  cat("\nLOO comparison -- does language_group improve predictive accuracy\n")
+  cat("beyond", covariate, "alone? (Non-decisive result expected when effect\n")
+  cat("is real but modest relative to within-group variance.)\n")
+  m_null <- check_loo_pareto(m_null, paste(section_label, "null"))
+  m_full <- check_loo_pareto(m_full, paste(section_label, "full"))
+  print(loo_compare(m_null, m_full))
+
+  # Marginal means
+  cat("\nBACK-TRANSFORMED MARGINAL MEANS -- controlling for", covariate,
+      "(seconds, 89% CrI):\n")
+  print(summarise_group_means(m_full))
+
+  # Bayes R2
+  cat("\nBAYES R-SQUARED:\n")
+  print(round(bayes_R2(m_full), 3))
+
+  # Pairwise contrasts
+  cat("\nPAIRWISE CONTRASTS -- language_group, controlling for", covariate,
+      "\n(log scale, 89% CrI, P(beta > 0 | data)):\n")
+  print(summarise_contrasts(m_full))
+
+  # Posterior plot
+  print(
+    posterior_plot(m_full,
+                   title    = paste("Posterior Distributions:", section_label),
+                   fill_col = fill_col)
+  )
+
+  invisible(list(null = m_null, full = m_full))
+}
+```
+
+## 8A: Full Semantic Category -- All Points
+
+```{r sem-8a}
+sem8a <- run_sem_analysis(
+  data          = sem_duration_data,
+  covariate     = "semantic_cat",
+  section_label = "8A: Full Semantic Category -- All Points",
+  null_cache    = "sem_all_full_cat_null",
+  full_cache    = "sem_all_full_cat_full",
+  fill_col      = "steelblue"
+)
+```
+
+## 8B: Entity vs Other -- All Points
+
+```{r sem-8b}
+sem8b <- run_sem_analysis(
+  data          = sem_entoth,
+  covariate     = "entity_vs_other",
+  section_label = "8B: Entity vs Other -- All Points",
+  null_cache    = "sem_all_entoth_null",
+  full_cache    = "sem_all_entoth_full",
+  fill_col      = "steelblue"
+)
+```
+
+## 8C: Action vs Static -- All Points
+
+```{r sem-8c}
+sem8c <- run_sem_analysis(
+  data          = sem_acstat,
+  covariate     = "action_vs_static",
+  section_label = "8C: Action vs Static -- All Points",
+  null_cache    = "sem_all_acstat_null",
+  full_cache    = "sem_all_acstat_full",
+  fill_col      = "steelblue"
+)
+```
+
+# Semantic Controls -- Isolated Utterances (9A / 9B / 9C)
+
+```{r sem-focused-data-prep}
+# "unclear" semantic category excluded: observations where the referent could
+# not be classified provide no valid semantic control information and would
+# conflate the control variable with missing data.
+sem_focused_data <- focused_duration_data %>%
+  filter(language_group != "English-Pronouns", !is.na(semantic_cat)) %>%
+  filter(semantic_cat != "unclear") %>%
+  mutate(
+    language_group   = droplevels(factor(language_group,
+                                          levels = c("English-Points","ASL","Homesign"))),
+    semantic_cat     = factor(semantic_cat),
+    entity_vs_other  = factor(case_when(
+      semantic_cat == "entity" ~ "entity",
+      semantic_cat %in% c("actor","instrument","patient","recipient","source",
+                          "location","picture","place","possessor") ~ "other",
+      TRUE ~ NA_character_)),
+    action_vs_static = factor(case_when(
+      semantic_cat %in% c("actor","instrument","patient","recipient","source") ~ "ACTION",
+      semantic_cat %in% c("entity","location","picture","place","possessor")   ~ "STATIC",
+      TRUE ~ NA_character_))
+  )
+
+sem_foc_entoth <- sem_focused_data %>% filter(!is.na(entity_vs_other))
+sem_foc_acstat <- sem_focused_data %>% filter(!is.na(action_vs_static))
+
+cat("Semantic-control (focused) sample sizes (unclear excluded):\n")
+sem_focused_data %>%
+  group_by(language_group) %>%
+  summarise(n_obs = n(), n_subjects = n_distinct(subject), .groups = "drop") %>%
+  print()
+```
+
+## 9A: Full Semantic Category -- Isolated Utterances
+
+```{r sem-9a}
+sem9a <- run_sem_analysis(
+  data          = sem_focused_data,
+  covariate     = "semantic_cat",
+  section_label = "9A: Full Semantic Category -- Isolated Utterances",
+  null_cache    = "sem_foc_full_cat_null",
+  full_cache    = "sem_foc_full_cat_full",
+  has_age_re    = FALSE,
+  fill_col      = "coral"
+)
+```
+
+## 9B: Entity vs Other -- Isolated Utterances
+
+```{r sem-9b}
+sem9b <- run_sem_analysis(
+  data          = sem_foc_entoth,
+  covariate     = "entity_vs_other",
+  section_label = "9B: Entity vs Other -- Isolated Utterances",
+  null_cache    = "sem_foc_entoth_null",
+  full_cache    = "sem_foc_entoth_full",
+  has_age_re    = FALSE,
+  fill_col      = "coral"
+)
+```
+
+## 9C: Action vs Static -- Isolated Utterances
+
+```{r sem-9c}
+sem9c <- run_sem_analysis(
+  data          = sem_foc_acstat,
+  covariate     = "action_vs_static",
+  section_label = "9C: Action vs Static -- Isolated Utterances",
+  null_cache    = "sem_foc_acstat_null",
+  full_cache    = "sem_foc_acstat_full",
+  has_age_re    = FALSE,
+  fill_col      = "coral"
+)
+```
+
+# Semantic Controls -- Points Not Alone (10A / 10B / 10C)
+
+```{r pna-data-prep}
+# "unclear" semantic category excluded: observations where the referent could
+# not be classified provide no valid semantic control information and would
+# conflate the control variable with missing data.
+points_not_alone <- combined_df %>%
+  filter(modality == "Points", utt_type != "point_alone", !is.na(language)) %>%
+  filter(semantic_cat != "unclear") %>%
+  mutate(
+    language_group   = create_language_group(language, modality),
+    age_numeric      = convert_age_to_numeric(age),
+    subject          = factor(subject),
+    semantic_cat     = factor(semantic_cat),
+    entity_vs_other  = factor(case_when(
+      semantic_cat == "entity" ~ "entity",
+      semantic_cat %in% c("actor","instrument","patient","recipient","source",
+                          "location","picture","place","possessor") ~ "other",
+      TRUE ~ NA_character_)),
+    action_vs_static = factor(case_when(
+      semantic_cat %in% c("actor","instrument","patient","recipient","source") ~ "ACTION",
+      semantic_cat %in% c("entity","location","picture","place","possessor")   ~ "STATIC",
+      TRUE ~ NA_character_)),
+    log_duration     = log(duration_sec)
+  ) %>%
+  filter(!is.na(language_group), !is.na(semantic_cat),
+         !is.na(duration_sec), is.finite(log_duration)) %>%
+  mutate(
+    language_group = droplevels(factor(language_group,
+                                        levels = c("English-Points","ASL","Homesign")))
+  )
+
+pn_entoth <- points_not_alone %>% filter(!is.na(entity_vs_other))
+pn_acstat <- points_not_alone %>% filter(!is.na(action_vs_static))
+
+cat("Points not alone -- sample sizes (unclear excluded):\n")
+points_not_alone %>%
+  group_by(language_group) %>%
+  summarise(n_obs = n(), n_subjects = n_distinct(subject), .groups = "drop") %>%
+  print()
+```
+
+## 10A: Full Semantic Category -- Points Not Alone
+
+```{r sem-10a}
+sem10a <- run_sem_analysis(
+  data          = points_not_alone,
+  covariate     = "semantic_cat",
+  section_label = "10A: Full Semantic Category -- Points Not Alone",
+  null_cache    = "sem_pna_full_cat_null",
+  full_cache    = "sem_pna_full_cat_full",
+  fill_col      = "mediumpurple"
+)
+```
+
+## 10B: Entity vs Other -- Points Not Alone
+
+```{r sem-10b}
+sem10b <- run_sem_analysis(
+  data          = pn_entoth,
+  covariate     = "entity_vs_other",
+  section_label = "10B: Entity vs Other -- Points Not Alone",
+  null_cache    = "sem_pna_entoth_null",
+  full_cache    = "sem_pna_entoth_full",
+  fill_col      = "mediumpurple"
+)
+```
+
+## 10C: Action vs Static -- Points Not Alone
+
+```{r sem-10c}
+sem10c <- run_sem_analysis(
+  data          = pn_acstat,
+  covariate     = "action_vs_static",
+  section_label = "10C: Action vs Static -- Points Not Alone",
+  null_cache    = "sem_pna_acstat_null",
+  full_cache    = "sem_pna_acstat_full",
+  fill_col      = "mediumpurple"
+)
+```
+
+# Prior Sensitivity Analysis
+
+```{r prior-sensitivity}
+cat("=== PRIOR SENSITIVITY ANALYSIS ===\n\n")
+cat("Purpose: confirm that main conclusions are not driven by the prior choice.\n")
+cat("If P(beta > 0 | data) values shift by < 0.05 between priors, results are robust.\n\n")
+cat("Standard priors: b ~ Normal(0, 0.5)\n")
+cat("Wide priors    : b ~ Normal(0, 1.0)  [2x wider]\n\n")
+
+bayes_dur_full_wide <- fit_or_load(
+  "dur_all_full_wide_priors",
+  log_duration ~ language_group + (1 | subject) + (1 | age_numeric),
+  data   = duration_data,
+  prior  = wide_priors,
+  family = gaussian()
+)
+
+check_diagnostics(bayes_dur_full_wide, "Log-LMM All Points -- Wide Priors")
+
+cat("\nFixed effects comparison (standard vs wide priors):\n\n")
+fe_std  <- round(fixef(bayes_dur_full     )[, c("Estimate","Q2.5","Q97.5")], 3)
+fe_wide <- round(fixef(bayes_dur_full_wide)[, c("Estimate","Q2.5","Q97.5")], 3)
+
+comparison <- data.frame(
+  Parameter    = rownames(fe_std),
+  Std_Est      = fe_std[, "Estimate"],  Std_Q2.5  = fe_std[, "Q2.5"],
+  Std_Q97.5   = fe_std[, "Q97.5"],
+  Wide_Est     = fe_wide[,"Estimate"],  Wide_Q2.5 = fe_wide[,"Q2.5"],
+  Wide_Q97.5  = fe_wide[,"Q97.5"]
+)
+print(comparison)
+
+cat("\nP(beta > 0 | data) -- standard priors:\n")
+print(summarise_contrasts(bayes_dur_full))
+
+cat("\nP(beta > 0 | data) -- wide priors:\n")
+print(summarise_contrasts(bayes_dur_full_wide))
+
+cat("\nCONCLUSION: If prob_positive values agree to within 0.05,\n")
+cat("conclusions are robust to the prior specification.\n")
+```
+
+## Subject-Level Variance: Posterior vs Prior Check
+
+```{r sd-prior-check}
+# With only N=3 subjects in ASL and Homesign, the model may not have enough
+# information to learn about subject-level variance separately from group effects.
+# If the posterior for sd_subject closely mirrors the Exp(1) prior, the data are
+# providing little information about individual differences. We inspect the posterior and then run a sensitivity analysis.
+
+cat("=== SUBJECT-LEVEL VARIANCE: POSTERIOR vs PRIOR CHECK ===\n\n")
+cat("ASL and Homesign groups each have N=3 subjects. With so few subjects,\n")
+cat("the posterior for sd_subject__Intercept may be largely prior-determined.\n\n")
+
+# Numerical posterior summary
+cat("Posterior summary -- sd_subject__Intercept (log-duration scale):\n")
+print(posterior_summary(bayes_dur_full, variable = "sd_subject__Intercept"))
+
+cat("\nBenchmark: Exp(1) prior has mean = 1.0 and 95th percentile = 3.0.\n")
+cat("If the posterior is similar, the data are not updating the prior strongly.\n\n")
+
+# Visual: posterior density overlaid with prior
+sd_draws <- as_draws_df(bayes_dur_full) %>%
+  dplyr::select(sd_subject = `sd_subject__Intercept`)
+
+ggplot(sd_draws, aes(x = sd_subject)) +
+  geom_density(fill = "steelblue", alpha = 0.5, colour = "steelblue4") +
+  stat_function(fun = dexp, args = list(rate = 1),
+                colour = "red", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = 2.2, y = 0.45, label = "Prior: Exp(1)", colour = "red",
+           size = 3.5) +
+  coord_cartesian(xlim = c(0, 5)) +
+  labs(title    = "Subject-Level SD: Posterior (blue) vs Prior (red dashed)",
+       subtitle  = "Close overlap => model not learning about individual variation from data",
+       x        = "sd_subject (log-duration units)", y = "Density") +
+  theme_minimal()
+```
+
+```{r sd-narrow-sensitivity}
+# Sensitivity analysis: narrower prior on subject-level SD.
+# Exponential(2) has expected value 0.5 (vs 1.0 for Exp(1)) -- more regularising.
+# It assumes subjects vary less a priori, forcing stronger data evidence to
+# estimate large individual differences. If the main conclusions are stable,
+# they do not depend on how much individual variation the prior permits.
+
+cat("=== SUBJECT-SD SENSITIVITY: NARROW PRIOR ON RANDOM-EFFECT VARIANCE ===\n\n")
+cat("Standard prior: sd ~ Exponential(1)  [E(sd) = 1.0 on log scale]\n")
+cat("Narrow   prior: sd ~ Exponential(2)  [E(sd) = 0.5 -- more regularising]\n")
+cat("Motivation: with N=3 deaf subjects, a narrower prior prevents the model\n")
+cat("from absorbing all between-subject variability into the random effect,\n")
+cat("which could mask true group-level differences.\n\n")
+
+narrow_sd_priors <- c(
+  prior(normal(0, 1),   class = Intercept),
+  prior(normal(0, 0.5), class = b),
+  prior(exponential(2), class = sd),    # more regularising than standard Exp(1)
+  prior(exponential(1), class = sigma)
+)
+
+bayes_dur_full_narrow_sd <- fit_or_load(
+  "dur_all_full_narrow_sd",
+  log_duration ~ language_group + (1 | subject) + (1 | age_numeric),
+  data   = duration_data,
+  prior  = narrow_sd_priors,
+  family = gaussian()
+)
+
+check_diagnostics(bayes_dur_full_narrow_sd, "Log-LMM All Points -- Narrow SD Prior")
+
+cat("\nFixed effects: standard Exp(1) vs narrow Exp(2) SD prior\n\n")
+fe_std <- round(fixef(bayes_dur_full          )[, c("Estimate","Q2.5","Q97.5")], 3)
+fe_nsd <- round(fixef(bayes_dur_full_narrow_sd)[, c("Estimate","Q2.5","Q97.5")], 3)
+
+comparison_sd <- data.frame(
+  Parameter    = rownames(fe_std),
+  Std_Est      = fe_std[, "Estimate"], Std_Q2.5   = fe_std[, "Q2.5"],
+  Std_Q97.5    = fe_std[, "Q97.5"],
+  NarrowSD_Est = fe_nsd[, "Estimate"], NarrowSD_Q2.5 = fe_nsd[, "Q2.5"],
+  NarrowSD_Q97.5 = fe_nsd[, "Q97.5"]
+)
+print(comparison_sd)
+
+cat("\nP(beta > 0 | data) -- standard SD prior Exp(1):\n")
+print(summarise_contrasts(bayes_dur_full))
+
+cat("\nP(beta > 0 | data) -- narrow SD prior Exp(2):\n")
+print(summarise_contrasts(bayes_dur_full_narrow_sd))
+
+cat("\nCONCLUSION: If prob_positive values agree to within 0.05 across priors,\n")
+cat("the main findings are robust to how the model accounts for individual-subject\n")
+cat("variance -- important assurance given the small N=3 deaf groups.\n")
+```
+
+
+
+
