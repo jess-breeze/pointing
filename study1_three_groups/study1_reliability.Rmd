@@ -1,0 +1,73 @@
+---
+title: "Study 1: Point duration in English-learners, ASL-learners and homesigners"
+subtitle: "Reliability of semantic-role coding"
+output:
+  html_document:
+    toc: false
+---
+
+Agreement between the original coder and a second coder on the semantic role
+of the referent of each point, for the subset of points coded twice in each
+group. Agreement is the percentage of points given the same role; Cohen's
+kappa corrects that percentage for agreement expected by chance from each
+coder's use of the categories.
+
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r functions}
+library(knitr)
+
+cohen_kappa <- function(a, b) {
+  levels <- sort(unique(c(a, b)))
+  tab <- table(factor(a, levels), factor(b, levels))
+  po <- sum(diag(tab)) / sum(tab)
+  pe <- sum(rowSums(tab) * colSums(tab)) / sum(tab)^2
+  (po - pe) / (1 - pe)
+}
+
+# Points coded by both coders: blank codes count as missing, and one
+# misspelled category is corrected.
+both_coded <- function(a, b) {
+  clean <- function(x) { x[x %in% ""] <- NA; x[x %in% "intrument"] <- "instrument"; x }
+  a <- clean(a); b <- clean(b)
+  keep <- !is.na(a) & !is.na(b)
+  data.frame(coder_1 = a[keep], coder_2 = b[keep])
+}
+
+agreement <- function(d, group) {
+  data.frame(group = group, points = nrow(d), agreed = sum(d$coder_1 == d$coder_2),
+             percent = 100 * mean(d$coder_1 == d$coder_2),
+             kappa = cohen_kappa(d$coder_1, d$coder_2))
+}
+```
+
+```{r reliability}
+english <- read.csv("data/reliability_english.csv", stringsAsFactors = FALSE)
+english <- english[english$reliability_dataset_inclusion %in% "reliability_code" &
+                     english$modality == "Points", ]
+english <- both_coded(english$semantic_cat, english$semantic_cat_reliability)
+
+asl <- read.delim("data/reliability_asl.txt", stringsAsFactors = FALSE, na.strings = "")
+asl <- both_coded(asl$semantic_category_AG, asl$semantic_category_ZL)
+
+homesign <- read.csv("data/reliability_homesign.csv", stringsAsFactors = FALSE)
+homesign <- both_coded(homesign$semantic_cat, homesign$reliability_semantic_category)
+
+kable(rbind(agreement(english, "English-learners"),
+            agreement(asl, "ASL-learners"),
+            agreement(homesign, "Homesigners")),
+      digits = c(0, 0, 0, 1, 2), row.names = FALSE)
+```
+
+```{r confusion}
+table(original = homesign$coder_1, second = homesign$coder_2)
+table(original = asl$coder_1, second = asl$coder_2)
+table(original = english$coder_1, second = english$coder_2)
+```
+
+```{r session-info}
+sessionInfo()
+```

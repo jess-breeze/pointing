@@ -1,0 +1,309 @@
+---
+title: "Study 1: Point duration in English-learners, ASL-learners and homesigners"
+subtitle: "Descriptive statistics and figures"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+This report produces Table 1, Figures 1 to 3, Table S2 and Figures S1 to S3,
+and the descriptive statistics given in their captions. 
+
+In the figures, dashed and dotted lines mark arithmetic means. The models in
+`study1_duration_models.Rmd` report geometric means, which are lower because
+durations are right-skewed.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, dpi = 150)
+```
+
+```{r packages}
+source("R/prepare_data.R")
+suppressPackageStartupMessages({
+  library(tidyr)
+  library(ggplot2)
+  library(knitr)
+})
+dir.create("figures", showWarnings = FALSE)
+options(knitr.kable.NA = "")
+
+points <- combined_df %>% filter(modality == "Points")
+stopifnot(all(is.na(combined_df$duration_sec[combined_df$modality == "Pronouns"])))
+
+# Child labels used in the manuscript. Homesigners are numbered by age at first
+# observation, as in Table 1.
+child_label <- c(ABY = "ASL1", JIL = "ASL2", NED = "ASL3",
+                 UCHS05 = "HS1", UCHS02 = "HS2", UCHS003 = "HS3")
+```
+
+# Coded points
+
+```{r coded-points}
+points %>%
+  group_by(language) %>%
+  summarise(children = n_distinct(subject), coded_points = n(),
+            with_duration = sum(!is.na(duration_sec)), .groups = "drop") %>%
+  kable(caption = "Points coded in each group, and points with a measured duration")
+```
+
+# Table 1
+
+Number of children observed at each age and, in parentheses, the number of
+points they produced. Homesigners' sessions are placed in the nearest
+four-month column.
+
+```{r table-1}
+ages <- c("1;06", "1;10", "2;02", "2;06", "2;10", "3;02", "3;06", "3;10")
+cell <- function(k, n) sprintf("%d (%d)", k, n)
+
+learners <- points %>%
+  filter(language != "Homesign") %>%
+  group_by(language, age) %>%
+  summarise(cell = cell(n_distinct(subject), n()), .groups = "drop") %>%
+  pivot_wider(names_from = age, values_from = cell)
+per_child <- points %>% filter(language != "Homesign") %>%
+  group_by(language) %>% summarise(per_child = round(n() / n_distinct(subject)), .groups = "drop")
+
+homesign_column <- c("1;06" = "1;06", "1;10" = "1;10", "2;02" = "2;02", "2;10" = "2;10",
+                     "3;00" = "3;02", "3;03" = "3;02", "3;05" = "3;06",
+                     "3;10" = "3;10", "3;11" = "3;10")
+homesigners <- homesign_raw %>%
+  filter(!is.na(Subject), Subject != "") %>%
+  mutate(column = homesign_column[Age]) %>%
+  count(Subject, column) %>%
+  group_by(language = child_label[Subject]) %>%
+  mutate(per_child = sum(n)) %>%
+  ungroup() %>%
+  transmute(language, column, cell = cell(1L, n), per_child) %>%
+  pivot_wider(names_from = column, values_from = cell)
+stopifnot(!anyNA(homesigners$language))
+
+bind_rows(left_join(learners, per_child, by = "language"), homesigners) %>%
+  mutate(language = recode(language, English = "English-learners", ASL = "ASL-learners")) %>%
+  select(group = language, any_of(ages), per_child) %>%
+  arrange(match(group, c("English-learners", "ASL-learners", "HS1", "HS2", "HS3"))) %>%
+  kable(caption = "Table 1")
+```
+
+# Figure 1
+
+Mean number of points per observation session in each of the nine semantic
+roles. Each role's count is divided by the number of sessions in the group,
+so sessions in which a role did not occur count as zero. Homesigners'
+sessions are counted as recording files, because two pairs of their
+sessions fall in the same four-month interval.
+
+```{r figure-1, fig.width = 8, fig.height = 10}
+roles <- c("actor", "patient", "recipient", "place", "instrument",
+           "source", "entity", "possessor", "location")
+coded <- points %>%
+  filter(!is.na(semantic_cat)) %>%
+  mutate(group = recode(language, English = "English-learners",
+                        ASL = "ASL-learners", Homesign = "Homesigners"))
+sessions <- c(
+  "English-learners" = nrow(distinct(filter(coded, language == "English"), subject, age)),
+  "ASL-learners"     = nrow(distinct(filter(coded, language == "ASL"), subject, age)),
+  "Homesigners"      = nrow(distinct(filter(homesign_raw, !is.na(Subject), Subject != ""), File)))
+sessions
+
+fig1_data <- coded %>%
+  filter(semantic_cat %in% roles) %>%
+  count(group, semantic_cat) %>%
+  mutate(per_session = n / sessions[group],
+         group = factor(group, levels = names(sessions)),
+         semantic_cat = factor(semantic_cat, levels = c(roles, "unclear")))
+fig1_data %>% group_by(group) %>%
+  summarise(points = sum(n), points_per_session = sum(per_session), .groups = "drop") %>%
+  kable(digits = 1)
+
+fig1 <- ggplot(fig1_data, aes(x = group, y = per_session, fill = semantic_cat)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  scale_fill_discrete(name = "Semantic Category") +
+  labs(x = "", y = "Average Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 16, angle = 70, hjust = 1, vjust = 1),
+        axis.text.y = element_text(size = 16),
+        axis.title.y = element_text(size = 18),
+        legend.text = element_text(size = 16),
+        legend.title = element_text(size = 18),
+        aspect.ratio = 1.2,
+        panel.background = element_rect(fill = "white", color = NA),
+        plot.background = element_rect(fill = "white", color = NA),
+        plot.margin = margin(t = 10, r = 10, b = 5, l = 10)) +
+  coord_cartesian(expand = FALSE)
+fig1
+ggsave("figures/Figure1.png", fig1, width = 5.02 * 1.6, height = 6.26 * 1.6, dpi = 300, bg = "white")
+```
+
+# Figures 2 and 3
+
+Density of point durations in each group, for all points (Figure 2) and for
+points produced alone (Figure 3). Kernel density estimates use ggplot2's
+default Gaussian kernel and bandwidth (Silverman's rule of thumb). The x-axis
+ends at 8 s.
+
+```{r figures-2-3, fig.width = 10, fig.height = 6}
+duration_density <- function(d) {
+  means <- d %>% group_by(language) %>%
+    summarise(mean_duration = mean(duration_sec, na.rm = TRUE), .groups = "drop")
+  labels <- c("English-learners", "ASL-learners", "Homesigners")
+  ggplot(d, aes(x = duration_sec, fill = language, color = language)) +
+    geom_density(alpha = 0.3) +
+    geom_vline(data = means, aes(xintercept = mean_duration, color = language),
+               linetype = "dashed", linewidth = 1) +
+    labs(x = "Duration (seconds)", y = "Density") +
+    scale_color_manual(values = scales::hue_pal()(3),
+                       breaks = c("English", "ASL", "Homesign"), labels = labels) +
+    scale_fill_manual(values = scales::hue_pal()(3),
+                      breaks = c("English", "ASL", "Homesign"), labels = labels) +
+    xlim(0, 8) + ylim(0, 0.8) +
+    theme_bw() +
+    theme(text = element_text(size = 17), axis.text = element_text(size = 17),
+          axis.title = element_text(size = 17), legend.text = element_text(size = 17),
+          legend.title = element_blank(),
+          legend.key.height = unit(1.2, "lines"), legend.key.width = unit(1.2, "lines")) +
+    guides(color = guide_legend(keyheight = 1.5), fill = guide_legend(keyheight = 1.5))
+}
+caption_stats <- function(d) d %>% filter(!is.na(duration_sec)) %>%
+  group_by(language) %>%
+  summarise(n = n(), mean_s = mean(duration_sec), sd_s = sd(duration_sec),
+            longer_than_8s = sum(duration_sec > 8), .groups = "drop")
+
+timed <- points %>% filter(!is.na(duration_sec))
+alone <- timed %>% filter(utt_type %in% "point_alone")
+
+kable(caption_stats(timed), digits = 2, caption = "Figure 2: all points")
+fig2 <- duration_density(timed)
+fig2
+ggsave("figures/Figure2.png", fig2, width = 10, height = 6, dpi = 300)
+
+kable(caption_stats(alone), digits = 2, caption = "Figure 3: points produced alone")
+fig3 <- duration_density(alone)
+fig3
+ggsave("figures/Figure3.png", fig3, width = 10, height = 6, dpi = 300)
+```
+
+# Table S2
+
+Points with a measured duration, by child. Alone: percentage of the points
+with a coded context. Unclear, other and no role: points whose semantic role
+was coded as unclear or other, or was not coded; these points are excluded
+only from the models that control for semantic role.
+
+```{r table-s2}
+per_child <- function(d) d %>% summarise(
+  points = n(), context_coded = sum(!is.na(utt_type)),
+  alone = sprintf("%d (%.1f)", sum(utt_type %in% "point_alone"),
+                  100 * sum(utt_type %in% "point_alone") / sum(!is.na(utt_type))),
+  unclear = sum(semantic_cat %in% "unclear"), other = sum(semantic_cat %in% "other"),
+  no_role = sum(is.na(semantic_cat)),
+  duration_s = sprintf("%.2f (%.2f)", mean(duration_sec), sd(duration_sec)),
+  .groups = "drop")
+
+bind_rows(
+  timed %>% mutate(child = coalesce(child_label[subject], subject)) %>%
+    group_by(language, child) %>% per_child(),
+  timed %>% mutate(child = "Total") %>% group_by(language, child) %>% per_child()) %>%
+  arrange(match(language, c("English", "ASL", "Homesign")), child == "Total") %>%
+  kable(caption = "Table S2")
+
+timed %>% filter(language == "Homesign", is.na(utt_type)) %>% nrow()
+```
+
+The last line is the number of homesigner points with no coded context. These
+points are in the all-points models but in none of the models of context.
+
+# Figures S1 to S3
+
+Density of point durations at each age, for each group (Figure S1), each
+ASL-learner (Figure S2) and each homesigner (Figure S3). Blue dotted lines show
+the mean of each panel; black dotted lines show the group's mean across ages
+(Figure S1) or the mean of the three ASL-learners at that age (Figure S2). The
+x-axis ends at 6 s; longer points are omitted from the densities but included
+in the means and SDs.
+
+```{r figure-s1, fig.width = 7, fig.height = 5}
+s1_data <- timed %>%
+  mutate(language = factor(recode(language, English = "English-learners",
+                                  ASL = "ASL-learners", Homesign = "Homesigners"),
+                           levels = c("ASL-learners", "English-learners", "Homesigners")))
+panel_stats <- s1_data %>% group_by(age, language) %>%
+  summarise(panel_mean = mean(duration_sec), sd = sd(duration_sec), .groups = "drop") %>%
+  mutate(label = paste0("M = ", round(panel_mean, 2), "\nSD = ", round(sd, 2)))
+group_means <- panel_stats %>% select(age, language) %>%
+  left_join(s1_data %>% group_by(language) %>%
+              summarise(group_mean = mean(duration_sec), .groups = "drop"), by = "language")
+
+fig_s1 <- ggplot(s1_data, aes(x = duration_sec, fill = language)) +
+  geom_density(alpha = 0.6, color = NA) +
+  geom_vline(data = panel_stats, aes(xintercept = panel_mean),
+             linetype = "dotted", linewidth = 0.8, color = "royalblue1", inherit.aes = FALSE) +
+  geom_vline(data = group_means, aes(xintercept = group_mean),
+             linetype = "dotted", linewidth = 0.8, color = "black", inherit.aes = FALSE) +
+  geom_text(data = panel_stats, aes(x = 5.9, y = 0.9, label = label),
+            hjust = 1, vjust = 1, size = 3, color = "black", inherit.aes = FALSE) +
+  scale_fill_manual(values = c("ASL-learners" = "#A6DBA0", "Homesigners" = "#F4A6A6",
+                               "English-learners" = "#9EC1E4"),
+                    name = "language", drop = FALSE) +
+  facet_grid(age ~ language, drop = FALSE) +
+  labs(x = "Duration (seconds)", y = "Density") +
+  theme_bw() +
+  theme(strip.text = element_text(size = 10, face = "bold"),
+        panel.spacing = unit(0.5, "lines"), legend.position = "right") +
+  xlim(0, 6) +
+  scale_y_continuous(breaks = c(0, 0.5, 1), limits = c(0, 1))
+fig_s1
+ggsave("figures/FigureS1.png", fig_s1, width = 7, height = 5, dpi = 450)
+
+timed %>% group_by(language) %>% summarise(longer_than_6s = sum(duration_sec > 6)) %>% kable()
+```
+
+```{r figures-s2-s3, fig.width = 7, fig.height = 5}
+# Per-child densities at each age. The y-axis extends to the highest density
+# in any panel (computed on 0 to 6 s), with a minimum of 1.
+child_density <- function(d, fill, age_means = FALSE) {
+  d <- d %>% mutate(child = child_label[subject])
+  peak <- d %>% group_by(age, child) %>%
+    summarise(peak = if (n() > 1) max(density(duration_sec, from = 0, to = 6)$y) else 0,
+              .groups = "drop")
+  y_max <- max(1, max(peak$peak) * 1.1)
+  panel_stats <- d %>% group_by(age, child) %>%
+    summarise(panel_mean = mean(duration_sec), sd = sd(duration_sec), .groups = "drop") %>%
+    mutate(label = paste0("M = ", round(panel_mean, 2), "\nSD = ", round(sd, 2)))
+  p <- ggplot(d, aes(x = duration_sec)) +
+    geom_density(fill = fill, alpha = 0.5, color = NA) +
+    facet_grid(age ~ child, drop = TRUE) +
+    labs(x = "Duration (seconds)", y = "Density") +
+    theme_bw() +
+    theme(strip.text = element_text(size = 10, face = "bold"),
+          panel.spacing = unit(0.5, "lines")) +
+    xlim(0, 6) +
+    scale_y_continuous(breaks = c(0, 0.5, 1), limits = c(0, y_max)) +
+    geom_text(data = panel_stats, aes(x = 4.5, y = y_max * 0.8, label = label),
+              hjust = 0, vjust = 1, size = 3, color = "black") +
+    geom_vline(data = panel_stats, aes(xintercept = panel_mean),
+               linetype = "dotted", linewidth = 0.8, color = "royalblue1")
+  if (age_means) {
+    age_stats <- panel_stats %>% select(age, child) %>%
+      left_join(d %>% group_by(age) %>% summarise(age_mean = mean(duration_sec)), by = "age")
+    p <- p + geom_vline(data = age_stats, aes(xintercept = age_mean),
+                        linetype = "dotted", linewidth = 0.8, color = "black")
+  }
+  p
+}
+fig_s2 <- child_density(filter(timed, language == "ASL"), "lightgreen", age_means = TRUE)
+fig_s2
+ggsave("figures/FigureS2.png", fig_s2, width = 7, height = 5, dpi = 450)
+
+fig_s3 <- child_density(filter(timed, language == "Homesign"), "coral")
+fig_s3
+ggsave("figures/FigureS3.png", fig_s3, width = 7, height = 5, dpi = 450)
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

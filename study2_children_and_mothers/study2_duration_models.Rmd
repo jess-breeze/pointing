@@ -1,0 +1,533 @@
+---
+title: "Study 2: Point duration in homesigners and their hearing mothers"
+subtitle: "Bayesian duration models"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+This report fits every Study 2 model reported in the main text and the
+Supplemental Materials, draws Figure 4, and ends with a table of each reported
+number and the model it comes from (Section 12).
+
+The data are the index-finger points that Kita, Brentari and Goldin-Meadow
+(2025) identified in two sessions of four homesigning children and their
+hearing mothers. Kita et al. timed the stroke of each point. Each point was
+re-coded so that the annotation runs from the onset of the stroke to the
+release of the hold, giving three measures per point: the stroke, the hold
+(the re-coded point minus the stroke) and the whole point.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5, dpi = 150)
+```
+
+```{r packages}
+source("../R/helpers.R")
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(knitr)
+  library(bayestestR)
+})
+```
+
+# Data
+
+```{r data}
+raw <- read.csv("data/kita_points_duration_recoded.csv",
+                check.names = FALSE, stringsAsFactors = FALSE)
+stopifnot(nrow(raw) == 1123)
+
+d_all <- raw %>%
+  rename(total_ms = `stroke+hold_ms`) %>%
+  mutate(person      = factor(person, levels = c("Child", "Mom")),
+         person_lab  = factor(if_else(person == "Child", "Homesigning children", "Mothers"),
+                              levels = c("Homesigning children", "Mothers")),
+         family      = factor(subject),
+         participant = factor(paste(subject, person, sep = "_")),
+         session_id  = factor(paste(subject, session, sep = ".")),
+         stroke_sec  = stroke_ms / 1000,
+         total_sec   = total_ms / 1000,
+         hold_sec    = hold_ms / 1000,
+         log_stroke  = log(stroke_sec),
+         log_total   = log(total_sec),
+         hold_prop   = hold_ms / total_ms,
+         floored     = hold_raw_ms < 0,
+         age_months  = as.numeric(age_at_session_months))
+```
+
+Table S5: points coded, by session.
+
+```{r table-s5}
+d_all %>% count(session = as.character(session_id), person) %>%
+  pivot_wider(names_from = person, values_from = n) %>%
+  bind_rows(summarise(., session = "Total", Child = sum(Child), Mom = sum(Mom))) %>%
+  kable()
+```
+
+A point made with both hands was coded once for each hand. Annotations that
+share a point identifier and overlap in time are treated as one point, and the
+longer annotation is kept. Annotations that share an identifier but do not
+overlap are separate points.
+
+```{r one-row-per-point}
+d_all <- d_all %>%
+  group_by(subject, session, kita_id) %>%
+  mutate(event_n  = n(),
+         overlaps = event_n > 1 & max(eaf_onset_ms) < min(eaf_offset_ms),
+         event_id = paste(subject, session, kita_id,
+                          if_else(overlaps, "E", as.character(row_number())), sep = "_")) %>%
+  ungroup()
+dat <- d_all %>% group_by(event_id) %>%
+  slice_max(total_ms, n = 1, with_ties = FALSE) %>% ungroup()
+
+# Whether a point was produced alone or with other gestures, from the
+# utterance coding (available for all but two points).
+combo <- dat %>%
+  filter(gm_accompanied %in% c("TRUE", "FALSE")) %>%
+  mutate(alone = factor(if_else(gm_accompanied == "TRUE", "In combination", "Alone"),
+                        levels = c("In combination", "Alone")),
+         accompanied = as.integer(gm_accompanied == "TRUE"),
+         n_companions = as.numeric(gm_n_companions))
+
+# Handshape at the end of the stroke, coded crisp or sloppy by Kita et al.
+crisp <- dat %>%
+  filter(sloppiness_offset %in% c("crisp", "sloppy")) %>%
+  mutate(crispness = factor(sloppiness_offset, levels = c("sloppy", "crisp")))
+
+# One row per point and phase, for the model of stroke and hold together.
+phase_dat <- dat %>%
+  select(event_id, participant, session_id, person, person_lab, family, stroke_sec, hold_sec) %>%
+  pivot_longer(c(stroke_sec, hold_sec), names_to = "phase", values_to = "dur_sec") %>%
+  mutate(phase = factor(if_else(phase == "stroke_sec", "Stroke", "Hold"),
+                        levels = c("Stroke", "Hold")))
+
+stopifnot(all(dat$stroke_sec > 0), all(dat$total_sec > 0), all(dat$hold_sec >= 0),
+          all(dat$stroke_ms + dat$hold_ms == dat$total_ms | dat$floored),
+          all(dat$hold_ms[dat$floored] == 0))
+
+dat %>% group_by(person_lab) %>%
+  summarise(points = n(), stroke_s = mean(stroke_sec), hold_s = mean(hold_sec),
+            whole_s = mean(total_sec), no_hold = sum(hold_sec == 0),
+            hold_set_to_zero = sum(floored), .groups = "drop") %>%
+  kable(digits = 2, caption = "Points analyzed (arithmetic means in seconds)")
+c(points = nrow(dat), context_coded = nrow(combo), alone = sum(combo$alone == "Alone"),
+  hold_zero = sum(dat$hold_sec == 0), hold_set_to_zero = sum(dat$floored))
+```
+
+
+# Priors
+
+As in Study 1, except that the intercept is Normal(-1, 1), which places 95%
+of the prior mass on geometric means between about 0.05 s and 2.7 s. For the
+hurdle part of the hold models (the probability that a point has no hold):
+intercept Normal(0, 1.5), effects Normal(0, 1).
+
+```{r priors}
+std_priors <- c(prior(normal(-1, 1), class = Intercept),
+                prior(normal(0, 0.5), class = b),
+                prior(exponential(1), class = sd),
+                prior(exponential(1), class = sigma))
+hurdle_priors <- c(std_priors,
+                   prior(normal(0, 1.5), class = Intercept, dpar = "hu"),
+                   prior(normal(0, 1), class = b, dpar = "hu"))
+
+ADAPT <- 0.99
+fit <- function(name, formula, data, prior = std_priors, family = gaussian(), adapt = ADAPT, ...)
+  fit_or_load(name, formula, data, prior, family, adapt_delta = adapt, ...)
+
+# Child is the reference level, so b_personMom is the mother - child contrast.
+draws_of <- function(m, par) as_draws_df(m)[[par]]
+geo_means <- function(m, b = "b_personMom", int = "b_Intercept", inv = exp) {
+  d <- as_draws_df(m)
+  bind_rows(summ(inv(d[[int]]), "Children"), summ(inv(d[[int]] + d[[b]]), "Mothers")) %>%
+    select(term, estimate, lower, upper)
+}
+share_within <- function(x, w) mean(abs(x) < w)
+```
+
+Every model has random intercepts for participant (eight: four children and
+four mothers) and session (eight). Each session is shared by a child and
+their mother, so the child-mother comparison is made within session.
+
+```{r prior-predictive, fig.height = 3.5}
+m_prior <- fit("prior_only_total",
+               bf(log_total ~ person + (1 | participant) + (1 | session_id)),
+               dat, sample_prior = "only")
+round(quantile(exp(posterior_predict(m_prior, ndraws = 400)), c(0.025, 0.5, 0.975)), 3)
+```
+
+# Whole point
+
+```{r whole-point, fig.height = 3.5}
+m_total <- fit("total_person",
+               bf(log_total ~ person + (1 | participant) + (1 | session_id)), dat)
+kable(convergence(m_total, "Whole point"), digits = 3)
+pp_check(m_total, ndraws = 100) + labs(x = "log duration") + theme_minimal()
+kable(geo_means(m_total), digits = 2, caption = "Geometric mean duration (s)")
+whole <- draws_of(m_total, "b_personMom")
+kable(summ(whole, "Mother - child (log-seconds)"), digits = 3)
+```
+
+# Stroke
+
+```{r stroke, fig.height = 3.5}
+m_stroke <- fit("stroke_person",
+                bf(log_stroke ~ person + (1 | participant) + (1 | session_id)), dat)
+kable(convergence(m_stroke, "Stroke"), digits = 3)
+pp_check(m_stroke, ndraws = 100) + labs(x = "log duration") + theme_minimal()
+kable(geo_means(m_stroke), digits = 2, caption = "Geometric mean duration (s)")
+stroke <- draws_of(m_stroke, "b_personMom")
+kable(summ(stroke, "Mother - child (log-seconds)"), digits = 3)
+
+# The 95% highest-density interval lies inside neither region of practical equivalence
+c(within_0.10 = share_within(stroke, 0.10), within_0.20 = share_within(stroke, 0.20),
+  p_difference_over_20_percent = mean(abs(stroke) > log(1.2)),
+  whole_point_within_0.10 = share_within(whole, 0.10))
+hdi(stroke, ci = 0.95)
+```
+
+# Hold
+
+The hold is zero for some points, so it is modeled with a hurdle log-normal
+likelihood, which estimates separately the probability that a point has no
+hold and the length of the hold when there is one.
+
+```{r hold, fig.height = 3.5}
+m_hold <- fit("hold_person",
+              bf(hold_sec ~ person + (1 | participant) + (1 | session_id),
+                 hu ~ person + (1 | participant)),
+              dat, prior = hurdle_priors, family = hurdle_lognormal())
+kable(convergence(m_hold, "Hold"), digits = 3)
+pp_check(m_hold, ndraws = 100) + coord_cartesian(xlim = c(0, 5)) + theme_minimal()
+kable(geo_means(m_hold), digits = 2, caption = "Hold length when there is a hold (s)")
+kable(summ(draws_of(m_hold, "b_personMom"), "Mother - child (log-seconds)"), digits = 3)
+
+m_hold_nf <- fit("hold_nofloor",
+                 bf(hold_sec ~ person + (1 | participant) + (1 | session_id),
+                    hu ~ person + (1 | participant)),
+                 filter(dat, !floored), prior = hurdle_priors, family = hurdle_lognormal())
+kable(geo_means(m_hold_nf, b = "b_hu_personMom", int = "b_hu_Intercept", inv = plogis),
+      digits = 2, caption = "Probability that a point has no hold (without the 30 points set to zero)")
+bind_rows(summ(draws_of(m_hold, "b_hu_personMom"), "All points"),
+          summ(draws_of(m_hold_nf, "b_hu_personMom"), "Without the 30 points set to zero")) %>%
+  kable(digits = 3, caption = "Mother - child difference in P(no hold), log-odds")
+```
+
+# Stroke and hold together
+
+One model of both phases of every point. The phase-by-person interaction is
+the difference between the mother - child contrast in the hold and in the
+stroke. A point-level intercept pairs the two phases of each point; random
+phase slopes for participant and session stop the interaction from being
+estimated as if it rested on 2,234 independent observations; and the residual
+standard deviation differs by phase. LKJ(2) prior on the random-effect
+correlations.
+
+```{r phase}
+phase_priors <- c(prior(normal(-1, 1), class = Intercept),
+                  prior(normal(0, 0.5), class = b),
+                  prior(exponential(1), class = sd),
+                  prior(lkj(2), class = cor),
+                  prior(normal(0, 1), class = Intercept, dpar = "sigma"),
+                  prior(normal(0, 0.5), class = b, dpar = "sigma"),
+                  prior(normal(0, 1.5), class = Intercept, dpar = "hu"),
+                  prior(normal(0, 1), class = b, dpar = "hu"))
+m_phase <- fit("phase_person_full",
+               bf(dur_sec ~ phase * person + (1 + phase | participant) +
+                    (1 + phase | session_id) + (1 | event_id),
+                  hu ~ phase * person, sigma ~ phase),
+               phase_dat, prior = phase_priors, family = hurdle_lognormal())
+
+# Alternative specifications (Table S6B)
+phase_pos <- phase_dat %>% filter(dur_sec > 0) %>% mutate(ld = log(dur_sec))
+m_phase_pos <- fit("phase_positive",
+                   bf(ld ~ phase * person + (1 + phase | participant) +
+                        (1 + phase | session_id) + (1 | event_id), sigma ~ phase),
+                   phase_pos,
+                   prior = c(prior(normal(-1, 1), class = Intercept),
+                             prior(normal(0, 0.5), class = b),
+                             prior(exponential(1), class = sd),
+                             prior(lkj(2), class = cor),
+                             prior(normal(0, 1), class = Intercept, dpar = "sigma"),
+                             prior(normal(0, 0.5), class = b, dpar = "sigma")))
+m_phase_simple <- fit("phase_person",
+                      bf(dur_sec ~ phase * person + (1 | event_id) + (1 | participant) +
+                           (1 | session_id), hu ~ phase * person),
+                      phase_dat, prior = hurdle_priors, family = hurdle_lognormal())
+
+d <- as_draws_df(m_phase)
+interaction <- d$`b_phaseHold:personMom`
+bind_rows(summ(d$b_personMom, "Mother - child, stroke"),
+          summ(d$b_personMom + interaction, "Mother - child, hold"),
+          summ(interaction, "Interaction (primary model)"),
+          summ(draws_of(m_phase_simple, "b_phaseHold:personMom"),
+               "Interaction, no random slopes, one residual SD"),
+          summ(draws_of(m_phase_pos, "b_phaseHold:personMom"),
+               "Interaction, positive durations only")) %>%
+  kable(digits = 3, caption = "Phase by person (log-seconds)")
+
+# A check that does not depend on the model: for each dyad and each session,
+# the hold contrast minus the stroke contrast in mean log duration (holds
+# longer than zero), tested against zero.
+by_unit <- function(unit) dat %>% filter(hold_sec > 0) %>%
+  group_by(.data[[unit]], person) %>%
+  summarise(hold = mean(log(hold_sec)), stroke = mean(log_stroke), .groups = "drop") %>%
+  pivot_wider(names_from = person, values_from = c(hold, stroke)) %>%
+  mutate(contrast = (hold_Mom - hold_Child) - (stroke_Mom - stroke_Child))
+for (unit in c("family", "session_id")) {
+  x <- by_unit(unit); tt <- t.test(x$contrast)
+  cat(sprintf("%s: mean %.3f, SD %.3f, t(%d) = %.2f, p = %.3f\n", unit,
+              mean(x$contrast), sd(x$contrast), tt$parameter, tt$statistic, tt$p.value))
+}
+```
+
+# The child-mother contrast within each dyad
+
+```{r per-dyad}
+m_dyad_total <- fit("perdyad_total",
+                    bf(log_total ~ person * family + (1 | session_id)), dat)
+m_dyad_stroke <- fit("perdyad_stroke",
+                     bf(log_stroke ~ person * family + (1 | session_id)), dat)
+m_dyad_hold <- fit("perdyad_hold",
+                   bf(hold_sec ~ person * family + (1 | session_id), hu ~ person),
+                   dat, prior = hurdle_priors, family = hurdle_lognormal())
+
+per_dyad <- function(m, measure) {
+  d <- as_draws_df(m); fams <- levels(dat$family)
+  bind_rows(lapply(seq_along(fams), function(i) {
+    x <- d$b_personMom
+    if (i > 1) x <- x + d[[paste0("b_personMom:family", fams[i])]]
+    summ(x, fams[i])
+  })) %>% mutate(measure = measure)
+}
+dyads <- bind_rows(per_dyad(m_dyad_total, "Whole point"),
+                   per_dyad(m_dyad_hold, "Hold"),
+                   per_dyad(m_dyad_stroke, "Stroke"))
+kable(dyads, digits = 3, caption = "Table S7: mother - child within each dyad (log-seconds)")
+```
+
+# Points produced alone
+
+```{r isolation}
+m_iso_total <- fit("iso_total",
+                   bf(log_total ~ alone * person + (1 | participant) + (1 | session_id)), combo)
+m_iso_stroke <- fit("iso_stroke",
+                    bf(log_stroke ~ alone * person + (1 | participant) + (1 | session_id)), combo)
+
+iso_effects <- function(m, measure) {
+  d <- as_draws_df(m); ix <- d$`b_aloneAlone:personMom`
+  bind_rows(summ(d$b_personMom, "Mother - child, with other gestures"),
+            summ(d$b_personMom + ix, "Mother - child, alone"),
+            summ(d$b_aloneAlone, "Alone - with other gestures, children"),
+            summ(d$b_aloneAlone + ix, "Alone - with other gestures, mothers"),
+            summ(ix, "Isolation by person interaction")) %>%
+    mutate(measure = measure)
+}
+iso <- bind_rows(iso_effects(m_iso_total, "Whole point"), iso_effects(m_iso_stroke, "Stroke"))
+kable(iso, digits = 3, caption = "Table S6C (log-seconds)")
+```
+
+# Handshape crispness
+
+```{r crispness}
+table(crisp$person_lab, crisp$crispness)
+m_crisp_stroke <- fit("crisp_stroke",
+                      bf(log_stroke ~ crispness * person + (1 | participant) + (1 | session_id)),
+                      crisp)
+m_crisp_hold <- fit("crisp_hold",
+                    bf(hold_sec ~ crispness * person + (1 | participant) + (1 | session_id),
+                       hu ~ crispness + person),
+                    crisp, prior = hurdle_priors, family = hurdle_lognormal())
+bind_rows(summ(draws_of(m_crisp_stroke, "b_crispnesscrisp"), "Stroke: crisp - sloppy, children"),
+          summ(draws_of(m_crisp_stroke, "b_crispnesscrisp:personMom"), "Stroke: crispness by person"),
+          summ(draws_of(m_crisp_hold, "b_crispnesscrisp"), "Hold length: crisp - sloppy, children"),
+          summ(draws_of(m_crisp_hold, "b_crispnesscrisp:personMom"), "Hold length: crispness by person"),
+          summ(draws_of(m_crisp_hold, "b_hu_crispnesscrisp"), "P(no hold): crisp - sloppy (log-odds)")) %>%
+  kable(digits = 3, caption = "Table S6D")
+```
+
+# Alternative specifications of the whole-point model
+
+Thirteen refits of the whole-point model, each changing one aspect of it
+(Table S8).
+
+```{r alternatives, fig.width = 8, fig.height = 5}
+f_total <- bf(log_total ~ person + (1 | participant) + (1 | session_id))
+
+m_wide <- fit("total_person_wide", f_total, dat,
+              prior = c(prior(normal(-1, 2), class = Intercept),
+                        prior(normal(0, 1), class = b),
+                        prior(exponential(1), class = sd),
+                        prior(exponential(1), class = sigma)))
+m_sd2 <- fit("total_person_narrowsd", f_total, dat,
+             prior = c(prior(normal(-1, 1), class = Intercept),
+                       prior(normal(0, 0.5), class = b),
+                       prior(exponential(2), class = sd),
+                       prior(exponential(1), class = sigma)))
+# The family-level fits have four levels, so adapt_delta is raised.
+m_family <- fit("total_person_family",
+                bf(log_total ~ person + (1 | participant) + (1 | session_id) + (1 | family)),
+                dat, adapt = 0.999)
+m_family_slope <- fit("total_person_familyslope",
+                      bf(log_total ~ person + (1 | participant) + (1 | session_id) +
+                           (1 + person || family)),
+                      dat, adapt = 0.999)
+utterances <- dat %>% filter(!gm_utt_num %in% c("", NA)) %>%
+  mutate(utt_id = factor(paste(session_id, person, gm_utt_num, sep = "_")))
+m_utterance <- fit("total_person_utt",
+                   bf(log_total ~ person + (1 | participant) + (1 | session_id) + (1 | utt_id)),
+                   utterances)
+m_gamma <- fit("total_gamma",
+               bf(total_sec ~ person + (1 | participant) + (1 | session_id)), dat,
+               prior = c(prior(normal(-1, 1), class = Intercept),
+                         prior(normal(0, 0.5), class = b),
+                         prior(exponential(1), class = sd),
+                         prior(exponential(1), class = shape)),
+               family = Gamma(link = "log"))
+m_person_session <- fit("total_ps",
+                        bf(log_total ~ person + (1 | participant) + (1 | session_id) + (1 | ps)),
+                        mutate(dat, ps = interaction(participant, session_id, drop = TRUE)))
+m_companions <- fit("total_ncomp",
+                    bf(log_total ~ person + ncomp + (1 | participant) + (1 | session_id)),
+                    combo %>% mutate(ncomp = as.numeric(gm_n_companions)) %>% filter(!is.na(ncomp)))
+m_no_zero_holds <- refit_on("sub_no_floored_total", m_total, filter(dat, !floored))
+m_without <- lapply(setNames(levels(dat$family), levels(dat$family)), function(f)
+  refit_on(paste0("loso_", f, "_total"), m_total, filter(dat, family != f)))
+
+alternatives <- c(
+  list("Wider priors: intercept Normal(-1, 2), fixed effects Normal(0, 1)" = m_wide,
+       "Random-effect SDs Exponential(2)" = m_sd2,
+       "Added family intercept" = m_family,
+       "Added person slope by family" = m_family_slope,
+       "Added utterance intercept" = m_utterance,
+       "Gamma likelihood" = m_gamma,
+       "Added person-by-session intercept" = m_person_session,
+       "Number of accompanying gestures as covariate" = m_companions,
+       "Without the 30 points with hold set to zero" = m_no_zero_holds),
+  setNames(m_without, paste("Without family", names(m_without))))
+
+table_s8 <- bind_rows(
+  summ(whole, "Primary model") %>% mutate(N = nobs(m_total)),
+  bind_rows(Map(function(m, label) summ(draws_of(m, "b_personMom"), label) %>% mutate(N = nobs(m)),
+                alternatives, names(alternatives))))
+kable(select(table_s8, term, N, estimate, lower, upper, p_positive), digits = 3,
+      caption = "Table S8: mother - child, whole point (log-seconds)")
+
+ggplot(table_s8, aes(estimate, reorder(term, estimate))) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_pointrange(aes(xmin = lower, xmax = upper)) +
+  labs(x = "Mother - child (log-seconds), 89% credible interval", y = NULL) +
+  theme_minimal(base_size = 11)
+```
+
+# Figure 4
+
+Density of point durations for children and mothers: the whole point (top) and
+the stroke (bottom), for all points (left) and points produced alone (right).
+Dashed lines are arithmetic means.
+
+```{r figure-4, fig.width = 11, fig.height = 7.5}
+person_cols <- c("Homesigning children" = "#619CFF", "Mothers" = "#F8766D")
+panel <- bind_rows(dat %>% mutate(set = "All points"),
+                   combo %>% filter(alone == "Alone") %>% mutate(set = "Isolated points only")) %>%
+  mutate(Stroke = stroke_sec, `Stroke + hold` = total_sec) %>%
+  pivot_longer(c(Stroke, `Stroke + hold`), names_to = "measure", values_to = "sec") %>%
+  mutate(measure = factor(measure, levels = c("Stroke + hold", "Stroke")),
+         set = factor(set, levels = c("All points", "Isolated points only")))
+panel_means <- panel %>% group_by(set, measure, person_lab) %>%
+  summarise(m = mean(sec), sd = sd(sec), n = n(), .groups = "drop")
+kable(panel_means, digits = 2)
+
+ggplot(panel, aes(x = sec, fill = person_lab, colour = person_lab)) +
+  geom_density(alpha = 0.3) +
+  geom_vline(data = panel_means, aes(xintercept = m, colour = person_lab),
+             linetype = "dashed", linewidth = 0.9) +
+  facet_grid(measure ~ set, scales = "free") +
+  scale_colour_manual(values = person_cols) +
+  scale_fill_manual(values = person_cols) +
+  coord_cartesian(xlim = c(0, 3)) +
+  labs(x = "Duration (seconds)", y = "Density") +
+  theme_bw() +
+  theme(text = element_text(size = 15), axis.text = element_text(size = 13),
+        axis.title = element_text(size = 15), legend.text = element_text(size = 14),
+        legend.title = element_blank(), legend.position = "top",
+        strip.text = element_text(size = 14, face = "bold"),
+        legend.key.height = unit(1.2, "lines"), legend.key.width = unit(1.2, "lines"))
+```
+
+# Convergence (Table S9)
+
+```{r convergence}
+reported <- c(
+  list("Stroke" = m_stroke, "Whole point" = m_total, "Hold" = m_hold,
+       "Hold, without points with hold set to zero" = m_hold_nf,
+       "Phase model, primary" = m_phase,
+       "Phase model, no random slopes, one residual SD" = m_phase_simple,
+       "Phase model, positive durations only" = m_phase_pos,
+       "Whole point x isolation" = m_iso_total, "Stroke x isolation" = m_iso_stroke,
+       "Stroke x crispness" = m_crisp_stroke, "Hold x crispness" = m_crisp_hold,
+       "Per dyad, whole point" = m_dyad_total, "Per dyad, hold" = m_dyad_hold,
+       "Per dyad, stroke" = m_dyad_stroke),
+  setNames(alternatives, paste("Whole point,", names(alternatives))))
+conv <- bind_rows(Map(convergence, reported, names(reported)))
+kable(conv, digits = c(0, 0, 3, 0, 0, 0, 0), row.names = FALSE)
+```
+
+# Numbers reported in the manuscript
+
+```{r manuscript-numbers}
+fmt <- function(r, p_label = "P") sprintf("%.3f [%.3f, %.3f]; %s = %.3f",
+                                          r$estimate, r$lower, r$upper, p_label, r$p_positive)
+gm <- function(m) with(geo_means(m), sprintf("children %.2f [%.2f, %.2f]; mothers %.2f [%.2f, %.2f]",
+  estimate[1], lower[1], upper[1], estimate[2], lower[2], upper[2]))
+no_hold <- geo_means(m_hold_nf, b = "b_hu_personMom", int = "b_hu_Intercept", inv = plogis)
+conv_text <- function(labels) with(conv[conv$model %in% labels, ],
+  sprintf("max R-hat %.3f; min bulk ESS %.0f; divergences %s",
+          max(max_rhat), min(bulk_ess_fixed), paste(divergences, collapse = "/")))
+
+data.frame(
+  result = c("Points: children, mothers",
+             "Points with no hold",
+             "Whole point: convergence",
+             "Whole point: mother - child; P(mother > child)",
+             "Whole point: geometric means (s)",
+             "Whole point: P(mother > child) in each dyad",
+             "Whole point: range over 13 alternative specifications",
+             "Whole point, with other gestures",
+             "Whole point, alone",
+             "Stroke, hold and phase models: convergence",
+             "Stroke: mother - child",
+             "Stroke: geometric means (s)",
+             "Stroke: posterior within +/-0.20",
+             "Hold length: mother - child",
+             "Hold length: geometric means (s)",
+             "P(no hold): children vs. mothers",
+             "Phase by person interaction"),
+  value = c(sprintf("%d, %d", sum(dat$person == "Child"), sum(dat$person == "Mom")),
+            sprintf("%d (%.1f%%)", sum(dat$hold_sec == 0), 100 * mean(dat$hold_sec == 0)),
+            conv_text("Whole point"),
+            fmt(summ(whole)),
+            gm(m_total),
+            paste(sprintf("%.3f", dyads$p_positive[dyads$measure == "Whole point"]), collapse = ", "),
+            sprintf("%.3f to %.3f", min(table_s8$estimate[-1]), max(table_s8$estimate[-1])),
+            fmt(iso[1, ]),
+            fmt(iso[2, ]),
+            conv_text(c("Stroke", "Hold", "Phase model, primary")),
+            fmt(summ(stroke)),
+            gm(m_stroke),
+            sprintf("%.0f%%", 100 * share_within(stroke, 0.20)),
+            fmt(summ(draws_of(m_hold, "b_personMom"))),
+            gm(m_hold),
+            sprintf("%.2f vs. %.2f", no_hold$estimate[1], no_hold$estimate[2]),
+            fmt(summ(interaction)))) %>%
+  kable()
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,450 @@
+---
+title: "Study 1: Point duration in English-learners, ASL-learners and homesigners"
+subtitle: "Bayesian duration models"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+This report fits every Study 1 duration model reported in the main text and
+the Supplemental Materials, and ends with a table of each reported number and
+the model it comes from (Section 11). 
+
+All models are Gaussian models of log-transformed duration, fitted with brms.
+Group means are posterior geometric means, back-transformed to seconds and
+averaged over the levels of any semantic covariate (emmeans). Intervals are
+89% credible intervals.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5, dpi = 150)
+```
+
+```{r packages}
+source("../R/helpers.R")
+source("R/prepare_data.R")
+suppressPackageStartupMessages({
+  library(emmeans)
+  library(tidybayes)
+  library(ggplot2)
+  library(loo)
+  library(knitr)
+  library(moments)
+})
+```
+
+# Priors
+
+Intercept Normal(0, 1), placing 95% of the prior mass on geometric means
+between about 0.14 s and 7.4 s; group contrasts Normal(0, 0.5), allowing
+differences of up to about 2.7 times; random-effect and residual standard
+deviations Exponential(1).
+
+```{r priors}
+std_priors <- c(prior(normal(0, 1), class = Intercept),
+                prior(normal(0, 0.5), class = b),
+                prior(exponential(1), class = sd),
+                prior(exponential(1), class = sigma))
+
+# Robustness checks (Section 9)
+wide_priors <- c(prior(normal(0, 2), class = Intercept),
+                 prior(normal(0, 1), class = b),
+                 prior(exponential(0.5), class = sd),
+                 prior(exponential(0.5), class = sigma))
+narrow_sd_priors <- c(prior(normal(0, 1), class = Intercept),
+                      prior(normal(0, 0.5), class = b),
+                      prior(exponential(2), class = sd),
+                      prior(exponential(1), class = sigma))
+gamma_priors <- c(prior(normal(0, 1), class = Intercept),
+                  prior(normal(0, 0.5), class = b),
+                  prior(exponential(1), class = sd),
+                  prior(exponential(1), class = shape))
+
+ADAPT <- 0.95
+fit <- function(name, formula, data, prior = std_priors, family = gaussian())
+  fit_or_load(name, formula, data, prior, family, adapt_delta = ADAPT)
+```
+
+```{r summary-functions}
+group_draws <- function(m) {
+  emmeans(m, ~ language_group) %>% gather_emmeans_draws() %>% ungroup() %>%
+    select(.draw, language_group, .value) %>%
+    pivot_wider(names_from = language_group, values_from = .value)
+}
+
+group_means <- function(m) {
+  emmeans(m, ~ language_group) %>% gather_emmeans_draws() %>%
+    group_by(language_group) %>%
+    summarise(mean_s = mean(exp(.value)),
+              lower = exp(quantile(.value, LO)), upper = exp(quantile(.value, HI)),
+              .groups = "drop")
+}
+
+# Contrasts in the direction used in Table S3. P is the probability that
+# English-learners' points are longer (first two rows) and that ASL-learners'
+# points are shorter than homesigners' (third row).
+group_contrasts <- function(m) {
+  d <- group_draws(m)
+  out <- bind_rows(summ(d$`English-Points` - d$ASL, "English - ASL"),
+                   summ(d$`English-Points` - d$Homesign, "English - homesign"),
+                   summ(d$ASL - d$Homesign, "ASL - homesign"))
+  out$P <- c(out$p_positive[1:2], 1 - out$p_positive[3])
+  select(out, term, estimate, lower, upper, P)
+}
+
+report <- function(m, caption) {
+  print(kable(group_means(m), digits = 2, caption = paste(caption, "- geometric mean duration (s)")))
+  print(kable(group_contrasts(m), digits = 3, caption = paste(caption, "- contrasts (log-seconds)")))
+}
+```
+
+# Data
+
+```{r data}
+all_points %>%
+  group_by(language_group) %>%
+  summarise(points = n(), children = n_distinct(subject),
+            mean_s = mean(duration_sec), sd_s = sd(duration_sec), .groups = "drop") %>%
+  kable(digits = 2, caption = "Points with a measured duration")
+
+data.frame(scale = c("seconds", "log-seconds"),
+           skewness = c(skewness(all_points$duration_sec), skewness(all_points$log_duration))) %>%
+  kable(digits = 2, caption = "Skewness of duration: the log scale removes most of the right skew")
+```
+
+# All points
+
+```{r prior-predictive, fig.height = 3.5}
+prior_check <- brm(log_duration ~ language_group + (1 | subject) + (1 | age_numeric),
+                   data = all_points, prior = std_priors, family = gaussian(),
+                   sample_prior = "only", chains = 2, iter = 1000, warmup = 500,
+                   seed = SEED, silent = 2, refresh = 0)
+round(quantile(exp(posterior_predict(prior_check, ndraws = 500)), c(0.05, 0.5, 0.95)), 2)
+round(quantile(all_points$duration_sec, c(0.05, 0.5, 0.95)), 2)
+```
+
+The prior predictive distribution (first line, seconds) is wider than the
+observed durations (second line) and places little mass on implausible values.
+
+```{r all-points, fig.height = 3.5}
+m_all <- fit("dur_all_full",
+             log_duration ~ language_group + (1 | subject) + (1 | age_numeric), all_points)
+kable(convergence(m_all, "All points"), digits = 3)
+pp_check(m_all, ndraws = 100) + labs(x = "log duration") + theme_minimal()
+report(m_all, "All points")
+```
+
+## Semantic controls
+
+Each model adds one semantic covariate: the nine semantic roles, entity versus
+other roles, or action versus static roles.
+
+```{r all-points-semantic}
+m_all_roles  <- fit("sem_all_full_cat_full",
+                    log_duration ~ language_group + semantic_cat + (1 | subject) + (1 | age_numeric),
+                    sem_all)
+m_all_entity <- fit("sem_all_entoth_full",
+                    log_duration ~ language_group + entity_vs_other + (1 | subject) + (1 | age_numeric),
+                    binary_subset(sem_all, "entity_vs_other"))
+m_all_action <- fit("sem_all_acstat_full",
+                    log_duration ~ language_group + action_vs_static + (1 | subject) + (1 | age_numeric),
+                    binary_subset(sem_all, "action_vs_static"))
+report(m_all_roles,  "All points + all roles")
+report(m_all_entity, "All points + entity vs. other")
+report(m_all_action, "All points + action vs. static")
+```
+
+# Points produced alone
+
+```{r isolated, fig.height = 3.5}
+m_iso <- fit("foc_full_age",
+             log_duration ~ language_group + (1 | subject) + (1 | age_numeric), isolated_points)
+kable(convergence(m_iso, "Isolated points"), digits = 3)
+pp_check(m_iso, ndraws = 100) + labs(x = "log duration") + theme_minimal()
+report(m_iso, "Isolated points")
+
+# Region of practical equivalence for the ASL - homesign contrast: proportion
+# of all posterior draws within +/-0.10 and +/-0.20 log-units.
+asl_hs_iso <- with(group_draws(m_iso), ASL - Homesign)
+c(within_0.10 = mean(abs(asl_hs_iso) < 0.10), within_0.20 = mean(abs(asl_hs_iso) < 0.20))
+
+# Standard deviation of the age random intercept
+summ(as_draws_df(m_iso)$sd_age_numeric__Intercept, "SD of age intercept")
+```
+
+## Semantic controls
+
+```{r isolated-semantic}
+m_iso_roles  <- fit("sem_foc_full_cat_full_age",
+                    log_duration ~ language_group + semantic_cat + (1 | subject) + (1 | age_numeric),
+                    sem_isolated)
+m_iso_entity <- fit("sem_foc_entoth_full_age",
+                    log_duration ~ language_group + entity_vs_other + (1 | subject) + (1 | age_numeric),
+                    binary_subset(sem_isolated, "entity_vs_other"))
+m_iso_action <- fit("sem_foc_acstat_full_age",
+                    log_duration ~ language_group + action_vs_static + (1 | subject) + (1 | age_numeric),
+                    binary_subset(sem_isolated, "action_vs_static"))
+report(m_iso_roles,  "Isolated + all roles")
+report(m_iso_entity, "Isolated + entity vs. other")
+report(m_iso_action, "Isolated + action vs. static")
+```
+
+## Without the age intercept
+
+The same four models without the age random intercept (Table S3).
+
+```{r isolated-no-age}
+m_iso_noage        <- fit("foc_full",
+                          log_duration ~ language_group + (1 | subject), isolated_points)
+m_iso_roles_noage  <- fit("sem_foc_full_cat_full",
+                          log_duration ~ language_group + semantic_cat + (1 | subject),
+                          sem_isolated)
+m_iso_entity_noage <- fit("sem_foc_entoth_full",
+                          log_duration ~ language_group + entity_vs_other + (1 | subject),
+                          binary_subset(sem_isolated, "entity_vs_other"))
+m_iso_action_noage <- fit("sem_foc_acstat_full",
+                          log_duration ~ language_group + action_vs_static + (1 | subject),
+                          binary_subset(sem_isolated, "action_vs_static"))
+report(m_iso_noage,        "Isolated, no age intercept")
+report(m_iso_roles_noage,  "Isolated + all roles, no age intercept")
+report(m_iso_entity_noage, "Isolated + entity vs. other, no age intercept")
+report(m_iso_action_noage, "Isolated + action vs. static, no age intercept")
+```
+
+# Points produced with other words, signs or gestures
+
+```{r with-other}
+m_with_roles  <- fit("sem_pna_full_cat_full",
+                     log_duration ~ language_group + semantic_cat + (1 | subject) + (1 | age_numeric),
+                     sem_with)
+m_with_entity <- fit("sem_pna_entoth_full",
+                     log_duration ~ language_group + entity_vs_other + (1 | subject) + (1 | age_numeric),
+                     binary_subset(sem_with, "entity_vs_other"))
+m_with_action <- fit("sem_pna_acstat_full",
+                     log_duration ~ language_group + action_vs_static + (1 | subject) + (1 | age_numeric),
+                     binary_subset(sem_with, "action_vs_static"))
+report(m_with_roles,  "With other acts + all roles")
+report(m_with_entity, "With other acts + entity vs. other")
+report(m_with_action, "With other acts + action vs. static")
+```
+
+# Isolation by group
+
+All points with a coded context, with group, isolation and their interaction
+as fixed effects (Table S4).
+
+```{r iso-by-group}
+m_ixg <- fit("dur_iso_main_interaction",
+             log_duration ~ language_group * isolated + (1 | subject) + (1 | age_numeric),
+             iso_by_group_points)
+kable(convergence(m_ixg, "Isolation by group"), digits = 3)
+
+emmeans(m_ixg, ~ language_group * isolated) %>% gather_emmeans_draws() %>%
+  group_by(language_group, isolated) %>%
+  summarise(mean_s = mean(exp(.value)),
+            lower = exp(quantile(.value, LO)), upper = exp(quantile(.value, HI)),
+            .groups = "drop") %>%
+  kable(digits = 2, caption = "Table S4A: geometric mean duration (s) by group and context")
+
+d <- as_draws_df(m_ixg)
+eng <- d$b_isolatedIsolated
+asl <- eng + d$`b_language_groupASL:isolatedIsolated`
+hs  <- eng + d$`b_language_groupHomesign:isolatedIsolated`
+bind_rows(summ(eng, "Alone - with other acts, English-learners"),
+          summ(asl, "Alone - with other acts, ASL-learners"),
+          summ(hs,  "Alone - with other acts, homesigners"),
+          summ(asl - eng, "ASL-learners vs. English-learners"),
+          summ(hs - eng,  "Homesigners vs. English-learners"),
+          summ(asl - hs,  "ASL-learners vs. homesigners")) %>%
+  kable(digits = 3, caption = "Table S4B: lengthening in isolation (log-seconds)")
+```
+
+# Robustness of the all-points model
+
+```{r robustness}
+m_all_wide <- fit("dur_all_full_wide_priors",
+                  log_duration ~ language_group + (1 | subject) + (1 | age_numeric),
+                  all_points, prior = wide_priors)
+m_all_sd2  <- fit("dur_all_full_narrow_sd",
+                  log_duration ~ language_group + (1 | subject) + (1 | age_numeric),
+                  all_points, prior = narrow_sd_priors)
+
+p <- function(m) { d <- group_draws(m)
+  c(`English - ASL` = mean(d$`English-Points` > d$ASL),
+    `English - homesign` = mean(d$`English-Points` > d$Homesign),
+    `ASL - homesign` = mean(d$ASL > d$Homesign)) }
+shift <- rbind(primary = p(m_all), wider_priors = p(m_all_wide), sd_exponential_2 = p(m_all_sd2))
+kable(shift, digits = 4, caption = "P(contrast > 0) under each prior")
+c(max_shift_wider_priors = max(abs(shift[2, ] - shift[1, ])),
+  max_shift_exponential_2 = max(abs(shift[3, ] - shift[1, ])))
+```
+
+The Gamma model is fitted to duration in seconds. To compare it with the
+log-normal model, the log-normal model's pointwise log-likelihood is moved to
+the seconds scale with the Jacobian of the log transform,
+log p(y) = log p(log y) - log y (Vehtari, Gelman & Gabry, 2017).
+
+```{r gamma}
+m_gamma <- fit("dur_all_gamma",
+               duration_sec ~ language_group + (1 | subject) + (1 | age_numeric),
+               all_points, prior = gamma_priors, family = Gamma(link = "log"))
+loo_lognormal <- loo(sweep(log_lik(m_all), 2, all_points$log_duration, "-"))
+loo_gamma     <- loo(log_lik(m_gamma))
+loo_compare(list(lognormal = loo_lognormal, gamma = loo_gamma))
+```
+
+# Figure S4: duration by string length
+
+Points produced alone are summarized from the isolated-point model with the
+nine semantic roles; points in strings of two or more elements from a model
+of points produced with other acts with group, string length and their
+interaction, and the nine semantic roles. Values are posterior means and
+standard deviations (in seconds) of the geometric mean.
+
+```{r figure-s4, fig.width = 7.5, fig.height = 4.2}
+m_len <- fit("dur_bin",
+             log_duration ~ group + semantic_cat + (1 | subject) + (1 | age_numeric) +
+               len_bin + group:len_bin,
+             by_length)
+
+length_labels <- c(L2 = "2", L3 = "3", L4 = "4", L5 = "5+")
+by_len <- emmeans(m_len, ~ group | len_bin) %>% gather_emmeans_draws() %>% ungroup() %>%
+  filter(group != "English") %>%
+  transmute(group = as.character(group), length = unname(length_labels[as.character(len_bin)]), .value)
+alone <- emmeans(m_iso_roles, ~ language_group) %>% gather_emmeans_draws() %>% ungroup() %>%
+  filter(language_group != "English-Points") %>%
+  transmute(group = as.character(language_group), length = "Alone", .value)
+
+counts <- bind_rows(
+  sem_isolated %>% filter(language_group != "English-Points") %>%
+    transmute(group = as.character(language_group), length = "Alone"),
+  by_length %>% filter(group != "English") %>%
+    transmute(group = as.character(group), length = unname(length_labels[as.character(len_bin)]))) %>%
+  count(group, length)
+
+fig_s4 <- bind_rows(alone, by_len) %>%
+  group_by(group, length) %>%
+  summarise(mean_s = mean(exp(.value)), se_s = sd(exp(.value)), .groups = "drop") %>%
+  left_join(counts, by = c("group", "length")) %>%
+  mutate(length = factor(length, levels = c("Alone", "2", "3", "4", "5+"))) %>%
+  arrange(length, group)
+kable(fig_s4, digits = 3)
+
+ggplot(fig_s4, aes(length, mean_s, colour = group, shape = group, group = group)) +
+  geom_line(position = position_dodge(0.12), linewidth = 0.8) +
+  geom_errorbar(aes(ymin = mean_s - se_s, ymax = mean_s + se_s),
+                position = position_dodge(0.12), width = 0.15) +
+  geom_point(position = position_dodge(0.12), size = 3) +
+  scale_colour_manual(values = c(ASL = "#00BA38", Homesign = "#619CFF"), name = NULL) +
+  scale_shape_manual(values = c(ASL = 16, Homesign = 17), name = NULL) +
+  expand_limits(y = 0) +
+  labs(x = "Elements in the string", y = "Point duration (s), model estimate ± 1 SE") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank())
+```
+
+# Convergence (Table S9)
+
+```{r convergence}
+reported <- list(
+  "All points" = m_all,
+  "All points + all roles" = m_all_roles,
+  "All points + entity vs. other" = m_all_entity,
+  "All points + action vs. static" = m_all_action,
+  "Isolated points" = m_iso,
+  "Isolated + all roles" = m_iso_roles,
+  "Isolated + entity vs. other" = m_iso_entity,
+  "Isolated + action vs. static" = m_iso_action,
+  "With other acts + all roles" = m_with_roles,
+  "With other acts + entity vs. other" = m_with_entity,
+  "With other acts + action vs. static" = m_with_action,
+  "Isolated points, no age intercept" = m_iso_noage,
+  "Isolated + all roles, no age intercept" = m_iso_roles_noage,
+  "Isolated + entity vs. other, no age intercept" = m_iso_entity_noage,
+  "Isolated + action vs. static, no age intercept" = m_iso_action_noage,
+  "Isolation by group" = m_ixg,
+  "All points, wider priors" = m_all_wide,
+  "All points, random-effect SDs Exponential(2)" = m_all_sd2,
+  "All points, Gamma likelihood" = m_gamma,
+  "Duration by string length (Figure S4)" = m_len)
+conv <- bind_rows(Map(convergence, reported, names(reported)))
+kable(conv, digits = c(0, 0, 3, 0, 0, 0, 0), row.names = FALSE)
+```
+
+# Numbers reported in the manuscript
+
+```{r manuscript-numbers}
+ci <- function(r, sign = 1) {
+  e <- sign * r$estimate; b <- sort(sign * c(r$lower, r$upper))
+  sprintf("%.3f [%.3f, %.3f]", e, b[1], b[2])
+}
+gm <- function(m) { g <- group_means(m)
+  paste(sprintf("%s %.2f [%.2f, %.2f]", c("English", "ASL", "homesign"),
+                g$mean_s, g$lower, g$upper), collapse = "; ") }
+p_range <- function(models, row) {
+  v <- sapply(models, function(m) group_contrasts(m)$P[row])
+  sprintf("%.3f to %.3f", min(v), max(v))
+}
+c_all <- group_contrasts(m_all); c_iso <- group_contrasts(m_iso)
+sem_all_models <- list(m_all_roles, m_all_entity, m_all_action)
+sem_iso_models <- list(m_iso_roles, m_iso_entity, m_iso_action)
+excludes_zero <- function(models, row) all(sapply(models, function(m) {
+  r <- group_contrasts(m)[row, ]; r$lower > 0 | r$upper < 0 }))
+
+data.frame(
+  result = c(
+    "All points: convergence (max R-hat; min fixed-effect bulk ESS; divergences)",
+    "All points: ASL - English, beta [89% CrI]; P(English > ASL)",
+    "All points: homesign - English; P(English > homesign)",
+    "All points: ASL - homesign; P(ASL < homesign)",
+    "All points: geometric means (s)",
+    "Semantic controls, all points: P(English > ASL)",
+    "Semantic controls, all points: P(ASL < homesign); intervals exclude 0 in all three",
+    "Semantic controls, all points: P(English > homesign); intervals exclude 0 in any",
+    "Isolated points: N, children",
+    "Isolated points: convergence",
+    "Isolated: ASL - English; P(English > ASL)",
+    "Isolated: homesign - English; P(English > homesign)",
+    "Isolated: ASL - homesign; P(ASL < homesign)",
+    "Isolated: ASL - homesign, posterior within +/-0.20",
+    "Isolated: geometric means (s)",
+    "Semantic controls, isolated: P(English > ASL)",
+    "Semantic controls, isolated: P(English > homesign)",
+    "Semantic controls, isolated: P(ASL < homesign)",
+    "Wider priors: largest change in P",
+    "Exponential(2) SD prior: largest change in P",
+    "Log-normal vs. Gamma: ELPD difference (SE)"),
+  value = c(
+    with(convergence(m_all, ""), sprintf("%.3f; %.0f; %d", max_rhat, bulk_ess_fixed, divergences)),
+    sprintf("%s; %.3f", ci(c_all[1, ], -1), c_all$P[1]),
+    sprintf("%s; %.3f", ci(c_all[2, ], -1), c_all$P[2]),
+    sprintf("%s; %.3f", ci(c_all[3, ]), c_all$P[3]),
+    gm(m_all),
+    p_range(sem_all_models, 1),
+    sprintf("%s; %s", p_range(sem_all_models, 3), excludes_zero(sem_all_models, 3)),
+    sprintf("%s; %s", p_range(sem_all_models, 2),
+            any(sapply(sem_all_models, function(m) { r <- group_contrasts(m)[2, ]; r$lower > 0 | r$upper < 0 }))),
+    sprintf("%d, %d", nobs(m_iso), n_distinct(isolated_points$subject)),
+    with(convergence(m_iso, ""), sprintf("%.3f; %.0f; %d", max_rhat, bulk_ess_fixed, divergences)),
+    sprintf("%s; %.3f", ci(c_iso[1, ], -1), c_iso$P[1]),
+    sprintf("%s; %.3f", ci(c_iso[2, ], -1), c_iso$P[2]),
+    sprintf("%s; %.3f", ci(c_iso[3, ]), c_iso$P[3]),
+    sprintf("%.1f%%", 100 * mean(abs(asl_hs_iso) < 0.20)),
+    gm(m_iso),
+    p_range(sem_iso_models, 1),
+    p_range(sem_iso_models, 2),
+    p_range(sem_iso_models, 3),
+    sprintf("%.4f", max(abs(shift[2, ] - shift[1, ]))),
+    sprintf("%.4f", max(abs(shift[3, ] - shift[1, ]))),
+    with(as.data.frame(loo_compare(list(lognormal = loo_lognormal, gamma = loo_gamma))),
+         sprintf("%.1f (%.1f)", elpd_diff[2], se_diff[2])))) %>%
+  kable()
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
